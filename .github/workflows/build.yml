@@ -1,0 +1,70 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Build ModernDisplay.asi
+        shell: cmd
+        run: build.bat
+
+      - name: Compute SHA-256
+        id: hash
+        shell: pwsh
+        run: |
+          $file = "build\ModernDisplay.asi"
+          if (-not (Test-Path $file)) { throw "Build output not found: $file" }
+          $sha = (Get-FileHash $file -Algorithm SHA256).Hash
+          $size = (Get-Item $file).Length
+          echo "sha256=$sha" >> $env:GITHUB_OUTPUT
+          echo "size=$size" >> $env:GITHUB_OUTPUT
+          echo "Built $file ($size bytes) SHA-256: $sha"
+
+      - name: Upload Actions Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ModernDisplay
+          path: build/ModernDisplay.asi
+          if-no-files-found: error
+
+      - name: Publish Immutable Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $sha = "${{ steps.hash.outputs.sha256 }}"
+          $size = "${{ steps.hash.outputs.size }}"
+          $bt = [char]96
+          $notes = @(
+            "Automated release build of **ModernDisplay** ($tag) compiled directly from repository sources via GitHub Actions (MSVC x86).",
+            "",
+            "- **File:** ${bt}ModernDisplay.asi${bt}",
+            "- **Size:** $size bytes",
+            "- **SHA-256:** ${bt}$sha${bt}",
+            "- **Commit:** ${bt}${{ github.sha }}${bt}"
+          )
+          [System.IO.File]::WriteAllLines("release_notes.md", $notes)
+          gh release create $tag --title "ModernDisplay $tag" --notes-file release_notes.md --draft
+          gh release upload $tag "build\ModernDisplay.asi"
+          gh release edit $tag --draft=false
