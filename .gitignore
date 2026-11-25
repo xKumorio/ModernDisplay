@@ -1,4 +1,7 @@
 build/
+showcase_env/
+scratch_showcase/
+RUN_*.bat
 *.obj
 *.pdb
 *.ilk

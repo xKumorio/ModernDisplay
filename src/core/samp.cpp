@@ -39,6 +39,8 @@ typedef void(__thiscall *SampAddCmd_t)(void *pInput, const char *name, SampCmdPr
 BYTE              *g_base = nullptr;
 const SampOffsets *g_ver = nullptr;
 SampAddCmd_t       g_fnAddCmd = nullptr;
+bool               g_mdHasSavedGfx = false;
+DisplayConfig      g_mdSavedGfx = {};
 bool               g_checked = false;
 bool               g_cmdRegistered = false;
 DWORD              g_startTick = 0;
@@ -507,13 +509,81 @@ void __cdecl CmdModernDisplay(const char *params)
 		} else {
 			ChatMsg("{FF6EC7}<" MD_NAME "> {FFFFFF}Before/After Split: {A8FFB0}MOUSE FOLLOW {CCCCCC}(Alt+F9 режим)");
 		}
+	} else if (_stricmp(cmd, "off") == 0) {
+		const bool anyGfxOn =
+			g_cfg.aoQuality > 0 || g_cfg.aaQuality > 0 || g_cfg.ssrQuality > 0 ||
+			g_cfg.giStrength > 0.001f || g_cfg.rainFx || g_cfg.bloomStrength > 0.001f ||
+			g_cfg.bloomFlare || g_cfg.fogStrength > 0.001f || g_cfg.tonemapMode > 0 ||
+			g_cfg.clarity > 0.001f || g_cfg.sharpness > 0.001f || (g_cfg.vibrance > 0.001f || g_cfg.vibrance < -0.001f) ||
+			g_cfg.anisotropy > 0 || g_cfg.deband || g_cfg.renderScale > 1.01f || g_cfg.lutName[0] != 0;
+		if (anyGfxOn) {
+			g_mdSavedGfx = g_cfg;
+			g_mdHasSavedGfx = true;
+		}
+		g_cfg.aoQuality     = 0;
+		g_cfg.aaQuality     = 0;
+		g_cfg.ssrQuality    = 0;
+		g_cfg.giStrength    = 0.0f;
+		g_cfg.rainFx        = false;
+		g_cfg.bloomStrength = 0.0f;
+		g_cfg.bloomFlare    = false;
+		g_cfg.fogStrength   = 0.0f;
+		g_cfg.tonemapMode   = 0;
+		g_cfg.clarity       = 0.0f;
+		g_cfg.sharpness     = 0.0f;
+		g_cfg.vibrance      = 0.0f;
+		g_cfg.anisotropy    = 0;
+		g_cfg.deband        = false;
+		g_cfg.renderScale   = 1.0f;
+		g_cfg.lutName[0]    = 0;
+		g_cfg.compareMode   = 0;
+		ConfigNotifyChanged();
+		ConfigSave();
+		ChatMsg("{FF6EC7}<" MD_NAME "> {FFFFFF}Вся графика: {FF9090}OFF {CCCCCC}(только оптимизации FPS; вернуть: /md on)");
+	} else if (_stricmp(cmd, "on") == 0) {
+		if (g_mdHasSavedGfx) {
+			g_cfg.aoQuality     = g_mdSavedGfx.aoQuality;
+			g_cfg.aoStrength    = g_mdSavedGfx.aoStrength;
+			g_cfg.aaQuality     = g_mdSavedGfx.aaQuality;
+			g_cfg.ssrQuality    = g_mdSavedGfx.ssrQuality;
+			g_cfg.giStrength    = g_mdSavedGfx.giStrength;
+			g_cfg.rainFx        = g_mdSavedGfx.rainFx;
+			g_cfg.bloomStrength = g_mdSavedGfx.bloomStrength;
+			g_cfg.bloomFlare    = g_mdSavedGfx.bloomFlare;
+			g_cfg.fogStrength   = g_mdSavedGfx.fogStrength;
+			g_cfg.tonemapMode   = g_mdSavedGfx.tonemapMode;
+			g_cfg.clarity       = g_mdSavedGfx.clarity;
+			g_cfg.sharpness     = g_mdSavedGfx.sharpness;
+			g_cfg.vibrance      = g_mdSavedGfx.vibrance;
+			g_cfg.anisotropy    = g_mdSavedGfx.anisotropy;
+			g_cfg.deband        = g_mdSavedGfx.deband;
+			g_cfg.renderScale   = g_mdSavedGfx.renderScale;
+			strncpy_s(g_cfg.lutName, g_mdSavedGfx.lutName, _TRUNCATE);
+		} else {
+			g_cfg.aoQuality     = 2;
+			g_cfg.aoStrength    = 0.85f;
+			g_cfg.aaQuality     = 3;
+			g_cfg.ssrQuality    = 1;
+			g_cfg.giStrength    = 0.35f;
+			g_cfg.rainFx        = true;
+			g_cfg.bloomStrength = 0.28f;
+			g_cfg.bloomFlare    = true;
+			g_cfg.fogStrength   = 0.18f;
+			g_cfg.tonemapMode   = 1;
+			g_cfg.clarity       = 0.03f;
+			g_cfg.anisotropy    = 16;
+			g_cfg.deband        = true;
+		}
+		ConfigNotifyChanged();
+		ConfigSave();
+		ChatMsg("{FF6EC7}<" MD_NAME "> {FFFFFF}Вся графика: {A8FFB0}ON {CCCCCC}(выключить: /md off)");
 	} else if (_stricmp(cmd, "hud") == 0 || _stricmp(cmd, "overlay") == 0) {
 		g_cfg.overlay = arg[0] ? (atoi(arg) != 0) : !g_cfg.overlay;
 		ConfigNotifyChanged();
 		ConfigSave();
 		ChatPrintf("{FF6EC7}<" MD_NAME "> {FFFFFF}Telemetry HUD: {A8FFB0}%s", g_cfg.overlay ? "ON" : "OFF");
 	} else {
-		ChatMsg("{FF6EC7}<" MD_NAME "> {CCCCCC}Команды: /md fps | bgfps | sharp | vibrance | scale | reflex | async | cache | shot | gamma | hud");
+		ChatMsg("{FF6EC7}<" MD_NAME "> {CCCCCC}Команды: /md on | off | ao | aa | ssr | gi | bloom | fog | tonemap | ssaa | fps | hud");
 	}
 }
 

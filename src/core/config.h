@@ -25,20 +25,20 @@ struct DisplayConfig {
 	int         bgFpsLimit      = 30;   // 0 = off, >0 = FPS cap when unfocused / minimized
 	int         aoQuality       = 0;    // 0 = off, 1 = low, 2 = medium, 3 = high (D3D11 Temporal XeGTAO)
 	float       aoStrength      = 0.85f;
-	int         aaQuality       = 3;    // 0 = off, 1 = SMAA 1x Med, 2 = SMAA 1x High, 3 = SMAA T2x (Temporal AA)
-	int         ssrQuality      = 1;    // 0 = off, 1 = Med (water + rain wet roads), 2 = High (32-step SSR)
-	float       giStrength      = 0.35f;// 0.00..1.00 Temporal Screen-Space Global Illumination (SSGI color bounce)
-	bool        rainFx          = true; // Animated rain ripples on SSR puddles + screen water droplets in rain
-	float       bloomStrength   = 0.28f;// 0.00..1.00 3D-only Dual-Kawase HDR Bloom
-	bool        bloomFlare      = true; // Subtle anamorphic lens flare on bright headlights/sun (3D-only)
-	float       fogStrength     = 0.18f;// 0.00..1.00 Volumetric Aerial Perspective / Depth Fog (auto-off in interiors)
-	int         tonemapMode     = 1;    // 0 = off, 1 = ACES Filmic, 2 = AgX Punchy
-	float       clarity         = 0.08f;// 0.00..1.00 3D-only Local Contrast (Clarity)
+	int         aaQuality       = 0;    // 0 = off, 1 = SMAA 1x Med, 2 = SMAA 1x High, 3 = SMAA T2x (Temporal AA)
+	int         ssrQuality      = 0;    // 0 = off, 1 = Med (water + rain wet roads), 2 = High (32-step SSR)
+	float       giStrength      = 0.0f; // 0.00..1.00 Temporal Screen-Space Global Illumination (SSGI color bounce)
+	bool        rainFx          = false;// Animated rain ripples on SSR puddles + screen water droplets in rain
+	float       bloomStrength   = 0.0f; // 0.00..1.00 3D-only Dual-Kawase HDR Bloom
+	bool        bloomFlare      = false;// Subtle anamorphic lens flare on bright headlights/sun (3D-only)
+	float       fogStrength     = 0.0f; // 0.00..1.00 Volumetric Aerial Perspective / Depth Fog (auto-off in interiors)
+	int         tonemapMode     = 0;    // 0 = off, 1 = ACES Filmic, 2 = AgX Punchy
+	float       clarity         = 0.0f; // 0.00..1.00 3D-only Local Contrast (Clarity)
 	float       sharpness       = 0.0f;
 	bool        depthCas        = true; // Restrict CAS / AO / LUT cleanly to 3D world (never touch 2D chat/HUD)
 	float       vibrance        = 0.0f;
-	int         anisotropy      = 16;   // 0, 2, 4, 8, 16 (forced D3D9 AF)
-	bool        deband          = true; // Sky/fog debanding + triangular dithering
+	int         anisotropy      = 0;    // 0, 2, 4, 8, 16 (forced D3D9 AF)
+	bool        deband          = false;// Sky/fog debanding + triangular dithering
 	bool        output10Bit     = true; // 10-bit R10G10B10A2_UNORM swapchain when supported
 	char        lutName[128]    = {};   // Optional .cube 3D LUT file in ModernDisplay/luts
 	float       renderScale     = 1.0f; // 1.00..2.00 SSAA internal supersampling + Catmull-Rom downscale
