@@ -110,6 +110,52 @@ bool HookHotpatchFn(void *target, void *detour, void **trampolineOut)
 	return false;
 }
 
+bool HookInlineFn(void *target, void *detour, void **trampolineOut)
+{
+	if (!target || !detour || !trampolineOut) return false;
+	BYTE *p = (BYTE *)target;
+
+	// Never overwrite an already-detoured entry point (would put us above the other mod).
+	if (p[0] == 0xE9 || p[0] == 0xEB)
+		return false;
+
+	size_t copyLen = 0;
+	if (p[0] == 0x8B && p[1] == 0xFF && p[2] == 0x55 && p[3] == 0x8B && p[4] == 0xEC) {
+		copyLen = 5; // mov edi, edi; push ebp; mov ebp, esp
+	} else if (p[0] == 0x6A && p[2] == 0xB8) {
+		copyLen = 7; // push imm8; mov eax, imm32 (Win10/11 d3d9 SEH prolog)
+	} else if (p[0] == 0x55 && p[1] == 0x8B && p[2] == 0xEC) {
+		if (p[3] == 0x83 && (p[4] == 0xEC || p[4] == 0xE4))
+			copyLen = 6; // push ebp; mov ebp, esp; sub/and esp, imm8
+		else if (p[3] == 0x6A)
+			copyLen = 5; // push ebp; mov ebp, esp; push imm8
+		else if (p[3] >= 0x50 && p[3] <= 0x57 && p[4] >= 0x50 && p[4] <= 0x57)
+			copyLen = 5; // push ebp; mov ebp, esp; push reg; push reg
+	}
+	if (copyLen < 5)
+		return false;
+
+	BYTE *tramp = (BYTE *)VirtualAlloc(nullptr, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+	if (!tramp) return false;
+	memcpy(tramp, p, copyLen);
+	tramp[copyLen] = 0xE9;
+	int32_t back = (int32_t)((uintptr_t)(p + copyLen) - (uintptr_t)(tramp + copyLen + 5));
+	memcpy(tramp + copyLen + 1, &back, 4);
+	FlushInstructionCache(GetCurrentProcess(), tramp, copyLen + 5);
+
+	BYTE patch[16];
+	memset(patch, 0x90, copyLen);
+	patch[0] = 0xE9;
+	int32_t rel = (int32_t)((uintptr_t)detour - (uintptr_t)(p + 5));
+	memcpy(patch + 1, &rel, 4);
+	if (!PatchBytes(p, patch, copyLen)) {
+		VirtualFree(tramp, 0, MEM_RELEASE);
+		return false;
+	}
+	*trampolineOut = tramp;
+	return true;
+}
+
 bool HookCallSite(DWORD siteAddr, void *dest, DWORD *origTargetOut)
 {
 	BYTE *site = (BYTE *)(uintptr_t)siteAddr;

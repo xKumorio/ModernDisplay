@@ -4,7 +4,7 @@
 #include <windows.h>
 
 #define MD_NAME       "ModernDisplay"
-#define MD_VERSION    "1.0"
+#define MD_VERSION    "2.0"
 #define MD_AUTHOR     "Softik Inquisitor"
 #define MD_AUTHOR_URL "https://vk.ru/miurawr"
 

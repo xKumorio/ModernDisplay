@@ -36,6 +36,6 @@ cl /nologo /MP /c /O2 /MT /EHsc /W4 /WX- /std:c++20 /utf-8 /DNDEBUG /DNOMINMAX /
 	src\main.cpp src\core\*.cpp src\gfx\*.cpp || exit /b 1
 
 link /nologo /DLL "/OUT:build\ModernDisplay.asi" build\obj\*.obj ^
-	user32.lib kernel32.lib d3d11.lib dxgi.lib dxguid.lib || exit /b 1
+	user32.lib kernel32.lib ole32.lib windowscodecs.lib d3d11.lib dxgi.lib dxguid.lib || exit /b 1
 
 echo OK: "build\ModernDisplay.asi"
