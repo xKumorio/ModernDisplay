@@ -1079,7 +1079,9 @@ public:
 			}
 			if (msg == WM_SYSCOMMAND) {
 				UINT sc = (UINT)(wp & 0xFFF0);
-				if (sc == SC_KEYMENU && s_swallowSysMenu) {
+				// Never let Alt / Alt+Space open the Win32 system menu modal loop (which freezes the game).
+				// Alt+Tab (DWM), Alt+F4 (SC_CLOSE), Alt+Shift, and Alt+Enter/F9/F10 are unaffected.
+				if (sc == SC_KEYMENU) {
 					s_swallowSysMenu = false;
 					return 0;
 				}
