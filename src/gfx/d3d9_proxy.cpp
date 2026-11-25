@@ -1033,6 +1033,38 @@ public:
 		}
 	}
 
+	static bool ShouldSkipAutoMinimize(HWND gameHwnd)
+	{
+		HWND fg = GetForegroundWindow();
+		if (!fg || fg == gameHwnd) return true;
+		if (MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST) != MonitorFromWindow(gameHwnd, MONITOR_DEFAULTTONEAREST))
+			return true;
+		LONG ex = GetWindowLongW(fg, GWL_EXSTYLE);
+		if ((ex & (WS_EX_TOPMOST | WS_EX_LAYERED)) == (WS_EX_TOPMOST | WS_EX_LAYERED))
+			return true;
+		DWORD fgPid = 0;
+		GetWindowThreadProcessId(fg, &fgPid);
+		if (fgPid) {
+			HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, fgPid);
+			if (hp) {
+				wchar_t exePath[MAX_PATH] = {};
+				DWORD len = MAX_PATH;
+				bool isOverlay = false;
+				if (QueryFullProcessImageNameW(hp, 0, exePath, &len)) {
+					const wchar_t *base = wcsrchr(exePath, L'\\');
+					base = base ? base + 1 : exePath;
+					if (_wcsicmp(base, L"NVIDIA Overlay.exe") == 0 ||
+					    _wcsicmp(base, L"NVIDIA Share.exe") == 0 ||
+					    _wcsicmp(base, L"GameBar.exe") == 0)
+						isOverlay = true;
+				}
+				CloseHandle(hp);
+				if (isOverlay) return true;
+			}
+		}
+		return false;
+	}
+
 	static LRESULT CALLBACK BorderlessWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 	{
 		ProxyDirect3DDevice9 *self = g_activeDev;
@@ -1053,7 +1085,7 @@ public:
 				EnsureTaskbarTab(hwnd);
 			}
 			if (msg == kMsgDeferMinimize) {
-				if (self->m_borderless && !self->m_closing && !self->m_isForeground && GetForegroundWindow() != hwnd) {
+				if (self->m_borderless && !self->m_closing && !self->m_isForeground && !ShouldSkipAutoMinimize(hwnd)) {
 					if (!IsIconic(hwnd)) {
 						self->m_inOwnResize = true;
 						ShowWindow(hwnd, SW_SHOWMINNOACTIVE);
