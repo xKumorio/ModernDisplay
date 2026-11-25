@@ -6,6 +6,8 @@
 
 ![ModernDisplay 2.0 — Las Venturas Strip](docs/media/hero_lv_strip.jpg)
 
+**[Смотреть видео-демонстрацию на YouTube (1440p60)](https://www.youtube.com/watch?v=uHZbIHgrq50)**
+
 > **По умолчанию (без `.ini`-файла)** плагин **не меняет графику вообще** — работают только оптимизации FPS, мгновенный Alt-Tab и снижение задержки. Все визуальные эффекты включаются по желанию одной командой `/md on` прямо в игре или через `ModernDisplay.ini`.
 
 ---
