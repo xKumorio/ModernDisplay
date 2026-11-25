@@ -201,6 +201,8 @@ static void BringGameWindowToFront(HWND hwnd)
 	SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
 	BringWindowToTop(hwnd);
 	SetForegroundWindow(hwnd);
+	if (GetForegroundWindow() == hwnd && GetFocus() != hwnd)
+		SetFocus(hwnd);
 	SetActiveWindow(hwnd);
 
 	if (attached)
