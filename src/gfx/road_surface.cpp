@@ -70,8 +70,10 @@ bool RoadSurfaceCache::Update(const float view[16], RoadSurfaceGrid &output)
 		                 static_cast<unsigned>(x) % kRoadGridSize];
 	};
 
+	// Warm up fast (up to 20 raycasts/frame) until the grid has coverage, then cap at 8/frame to keep CPU latency low.
+	const int maxQueries = (m_lastRoadSamples >= 128 && x0 == m_lastOriginX && y0 == m_lastOriginY) ? 8 : 20;
 	int queries = 0;
-	for (int visited = 0; visited < count && queries < 20; ++visited) {
+	for (int visited = 0; visited < count && queries < maxQueries; ++visited) {
 		const int i = static_cast<int>(m_cursor++ % count);
 		const int x = x0 + i % kRoadGridSize;
 		const int y = y0 + i / kRoadGridSize;
@@ -86,6 +88,11 @@ bool RoadSurfaceCache::Update(const float view[16], RoadSurfaceGrid &output)
 		++queries;
 	}
 
+	if (queries == 0 && x0 == m_lastOriginX && y0 == m_lastOriginY && output.revision == m_revision && m_revision != 0)
+		return m_lastRoadSamples != 0;
+
+	m_lastOriginX = x0;
+	m_lastOriginY = y0;
 	output.originX = x0;
 	output.originY = y0;
 	unsigned roadSamples = 0;
@@ -97,6 +104,8 @@ bool RoadSurfaceCache::Update(const float view[16], RoadSurfaceGrid &output)
 		output.heights[i] = valid ? sample.height : kNoRoadHeight;
 		roadSamples += output.heights[i] != kNoRoadHeight;
 	}
+	m_lastRoadSamples = roadSamples;
+	output.revision = ++m_revision;
 	static bool logged = false;
 	if (roadSamples && !logged) {
 		logged = true;

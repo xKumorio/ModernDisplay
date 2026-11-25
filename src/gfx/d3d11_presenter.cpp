@@ -552,6 +552,7 @@ void D3D11Presenter::Shutdown()
 	SafeRelease(m_roadPuddlesPS);
 	SafeRelease(m_roadGridSrv);
 	SafeRelease(m_roadGridTexture);
+	m_uploadedRoadGridRev = 0;
 	SafeRelease(m_ssrPS);
 	SafeRelease(m_smaaCB);
 	SafeRelease(m_smaaWeightPS);
@@ -1321,7 +1322,10 @@ ID3D11ShaderResourceView *D3D11Presenter::RenderSsr(int slot, int quality, bool 
 			loggedRoadPuddles = true;
 			Log("Rain: road puddles active at %ux%u (wet=%.2f)", native ? m_gameW : ssrW, native ? m_gameH : ssrH, wetAmt);
 		}
-		m_ctx->UpdateSubresource(m_roadGridTexture, 0, nullptr, roadGrid.heights, kRoadGridSize * sizeof(float), 0);
+		if (roadGrid.revision != m_uploadedRoadGridRev || m_uploadedRoadGridRev == 0) {
+			m_ctx->UpdateSubresource(m_roadGridTexture, 0, nullptr, roadGrid.heights, kRoadGridSize * sizeof(float), 0);
+			m_uploadedRoadGridRev = roadGrid.revision;
+		}
 		ID3D11ShaderResourceView *roadSrvs[] = {
 			colSrv, m_aoDepthSrv, m_sharedDepthSrv[slot], m_roadGridSrv, m_ssrSrv, m_actorSrv[slot]
 		};

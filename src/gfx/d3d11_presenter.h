@@ -229,6 +229,7 @@ private:
 	ID3D11Texture2D          *m_roadGridTexture = nullptr;
 	ID3D11ShaderResourceView *m_roadGridSrv = nullptr;
 	RoadSurfaceGrid          m_roadGrids[kNumSlots];
+	unsigned                 m_uploadedRoadGridRev = 0;
 	ID3D11PixelShader        *m_ssrBlurPS = nullptr;
 	ID3D11Buffer             *m_ssrCB = nullptr;
 	ID3D11Texture2D          *m_ssrTex = nullptr;
