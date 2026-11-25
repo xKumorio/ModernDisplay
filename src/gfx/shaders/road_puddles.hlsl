@@ -103,7 +103,7 @@ float RoadCoverage(float3 world, float2 uv, out float3 asphalt)
 {
     asphalt = 0;
     float2 cell = world.xy * rcp(roadGridSpacing) - roadGridOrigin;
-    if (any(cell < 0) || any(cell >= 31.0)) return 0;
+    if (any(cell < 0) || any(cell >= 47.0)) return 0;
     int2 first = int2(floor(cell));
     float2 blend = frac(cell);
     float4 heights = float4(roadHeights.Load(int3(first, 0)),
@@ -265,7 +265,7 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET
     float3 surfaceNormal = cross(horizontal, vertical);
     float planar = abs(surfaceNormal.z) * rsqrt(max(dot(surfaceNormal, surfaceNormal), 1e-12));
     float distance = Linearize(sceneZ);
-    if (sceneZ >= 0.9998 || distance > 54.0 || planar < 0.75)
+    if (sceneZ >= 0.9998 || distance > 102.0 || planar < 0.75)
         return classicReflection.SampleLevel(linearSampler, uv, 0);
 
     float3 asphalt;
@@ -310,10 +310,16 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET
         float skyLuma = dot(reflectedSky, float3(0.2126, 0.7152, 0.0722));
         reflectedSky = lerp(reflectedSky, skyLuma.xxx, 0.30 * wetness);
         float3 floorNormal = normalize(surfaceNormal) * sign(surfaceNormal.z);
-        float4 actor = PlayerSample(world, ray);
+        float4 actor = (distance < 32.0) ? PlayerSample(world, ray) : float4(0, 0, 0, 0);
         float4 hit = 0;
-        if (actor.a < 0.995) hit = TraceReflection(world, floorNormal, ray);
-        float3 reflected = lerp(reflectedSky, hit.rgb, hit.a);
+        // Full raymarch within 52 m; beyond 52 m blend seamlessly to sky + classicReflection with 0 raymarch cost.
+        float traceFade = 1.0 - smoothstep(42.0, 52.0, distance);
+        if (actor.a < 0.995 && traceFade > 0.001) {
+            hit = TraceReflection(world, floorNormal, ray);
+            hit.a *= traceFade;
+        }
+        float3 farRefl = lerp(reflectedSky, classic.rgb, classic.a * 0.65);
+        float3 reflected = lerp(farRefl, hit.rgb, hit.a);
         reflected = lerp(reflected, actor.rgb, actor.a);
         float waterDepth = smoothstep(0.0, 0.095, depth);
         float3 bed = lerp(wetAsphalt, asphalt * float3(0.63, 0.66, 0.68), waterDepth);
@@ -325,7 +331,7 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET
         result = lerp(result, puddle, coverage);
     }
 
-    float opacity = wetness * roadCoverage * (1.0 - smoothstep(35.0, 54.0, distance)) * lerp(0.55, 1.0, coverage);
+    float opacity = wetness * roadCoverage * (1.0 - smoothstep(82.0, 102.0, distance)) * lerp(0.55, 1.0, coverage);
     float4 road = float4(result, opacity);
     float blend = smoothstep(0.03, 0.22, opacity);
     float alpha = lerp(classic.a, road.a, blend);

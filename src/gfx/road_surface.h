@@ -2,8 +2,8 @@
 
 #include <windows.h>
 
-constexpr int kRoadGridSize = 32;
-constexpr float kRoadGridSpacing = 2.0f;
+constexpr int kRoadGridSize = 48;
+constexpr float kRoadGridSpacing = 3.0f;
 constexpr float kNoRoadHeight = -10000.0f;
 constexpr float kUnknownMaterialOffset = 4096.0f;
 
