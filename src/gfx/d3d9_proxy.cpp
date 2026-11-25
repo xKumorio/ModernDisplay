@@ -139,6 +139,7 @@ static inline void SafeRelease(T *&p)
 	if (p) { p->Release(); p = nullptr; }
 }
 
+#pragma comment(lib, "gdi32.lib")
 static HWND CreateHiddenDummyWindow(int w, int h)
 {
 	static ATOM s_atom = 0;
@@ -147,11 +148,17 @@ static HWND CreateHiddenDummyWindow(int w, int h)
 		WNDCLASSA wc = {};
 		wc.lpfnWndProc = DefWindowProcA;
 		wc.hInstance = inst;
+		wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
 		wc.lpszClassName = "ModernDisplayDummyD3D9";
 		s_atom = RegisterClassA(&wc);
 	}
-	return CreateWindowExA(0, "ModernDisplayDummyD3D9", "", WS_POPUP,
-	                       0, 0, w > 0 ? w : 1, h > 0 ? h : 1, nullptr, nullptr, inst, nullptr);
+	HWND hw = CreateWindowExA(
+		WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_LAYERED,
+		"ModernDisplayDummyD3D9", "", WS_POPUP,
+		-32000, -32000, w > 0 ? w : 1, h > 0 ? h : 1, nullptr, nullptr, inst, nullptr);
+	if (hw)
+		SetLayeredWindowAttributes(hw, 0, 0, LWA_ALPHA);
+	return hw;
 }
 
 static void QueryMonitorRect(HWND hwnd, RECT &rc, UINT &refreshHz, RECT *workRcOut = nullptr)
@@ -822,6 +829,7 @@ public:
 		    curRc.left != monRc.left || curRc.top != monRc.top ||
 		    (curRc.right - curRc.left) != monW || (curRc.bottom - curRc.top) != monH) {
 			m_inOwnResize = true;
+			SetClassLongPtrA(m_gameHwnd, GCLP_HBRBACKGROUND, (LONG_PTR)GetStockObject(BLACK_BRUSH));
 			if (zoomed || iconic)
 				ShowWindow(m_gameHwnd, SW_SHOWNORMAL);
 			SetWindowLongA(m_gameHwnd, GWL_STYLE, wantStyle);
