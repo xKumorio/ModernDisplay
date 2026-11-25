@@ -1,5 +1,6 @@
 // ModernDisplay - Copyright (c) 2026 Softik Inquisitor (https://vk.ru/miurawr). All rights reserved.
 #include "managed_resources.h"
+#include "texture_mip_cache.h"
 #include "../core/config.h"
 #include "../core/log.h"
 #include <stdint.h>
@@ -156,6 +157,7 @@ struct PendingDxtJob {
 	UINT                 height = 0;
 	int                  srcPitch = 0;
 	uint32_t             gen = 0;
+	bool                 compressedMipCache = false;
 	std::vector<uint8_t> dxtBytes;
 };
 
@@ -165,7 +167,9 @@ struct ReadyMipJob {
 	UINT                 width = 0;
 	UINT                 height = 0;
 	uint32_t             gen = 0;
+	D3DFORMAT            fmt = D3DFMT_UNKNOWN;
 	std::vector<uint8_t> bgra8;
+	std::vector<uint8_t> compressed;
 };
 
 static SRWLOCK                   g_mipLock = SRWLOCK_INIT;
@@ -415,18 +419,18 @@ public:
 	}
 
 	bool HasExternalRefs() const { return InterlockedCompareExchange(const_cast<volatile LONG *>(&m_ref), 0, 0) > 1; }
-	uint32_t MipGen() const { return m_mipGen; }
+	bool CanApplyMip(uint32_t gen) const { return gen == m_mipGen && !m_dirty && m_lockCount == 0; }
 
 	void SwapToMipmappedGpuTex(IDirect3DTexture9 *newMipTex, uint32_t jobGen)
 	{
 		if (!newMipTex) return;
-		if (jobGen != m_mipGen) {
+		if (!CanApplyMip(jobGen)) {
 			newMipTex->Release();
 			return;
 		}
 		if (m_gpuTex) m_gpuTex->Release();
 		m_gpuTex = newMipTex;
-		m_gpuIsMipBgra = true;
+		m_gpuHasGeneratedMips = true;
 		// Notify proxy device so cached Stage binding re-binds the upgraded mipmapped GPU texture cleanly
 		if (g_destroyCb) g_destroyCb(static_cast<IDirect3DTexture9 *>(this));
 	}
@@ -443,7 +447,7 @@ public:
 			const uint32_t gen = ++m_mipGen;
 
 			// If still backed by original 1-level DXT GPU texture, upload immediately (~0.01ms) so Frame 0 has 0 missing textures!
-			if (!m_gpuIsMipBgra) {
+			if (!m_gpuHasGeneratedMips) {
 				m_sysTex->AddDirtyRect(nullptr);
 				m_devEx->UpdateTexture(m_sysTex, m_gpuTex);
 			}
@@ -461,6 +465,7 @@ public:
 				job.height = m_height;
 				job.srcPitch = lrSrc.Pitch;
 				job.gen = gen;
+				job.compressedMipCache = g_cfg.compressedMipCache;
 				job.dxtBytes.resize(totalBytes);
 				memcpy(job.dxtBytes.data(), lrSrc.pBits, totalBytes);
 				m_sysTex->UnlockRect(0);
@@ -595,7 +600,7 @@ private:
 	bool                m_blockCompressed;
 	D3DFORMAT           m_asyncDxtFmt = D3DFMT_UNKNOWN;
 	bool                m_autoMipDirect = false;
-	bool                m_gpuIsMipBgra = false;
+	bool                m_gpuHasGeneratedMips = false;
 	uint32_t            m_mipGen = 0;
 	volatile LONG       m_ref;
 	int                 m_lockCount = 0;
@@ -1027,7 +1032,7 @@ static DWORD WINAPI MipWorkerThreadProc(LPVOID)
 		AcquireSRWLockExclusive(&g_mipLock);
 		while (g_mipPending.empty() && !g_mipWorkersStop)
 			SleepConditionVariableSRW(&g_mipCv, &g_mipLock, INFINITE, 0);
-		if (g_mipWorkersStop && g_mipPending.empty()) {
+		if (g_mipWorkersStop) {
 			ReleaseSRWLockExclusive(&g_mipLock);
 			return 0;
 		}
@@ -1041,12 +1046,24 @@ static DWORD WINAPI MipWorkerThreadProc(LPVOID)
 		ready.width  = job.width;
 		ready.height = job.height;
 		ready.gen    = job.gen;
+		ready.fmt    = job.fmt;
 
 		// Skip CPU decode completely if the game already released the texture (still push empty ready job so main thread calls Release() safely!)
 		if (IsTextureAliveForMip(job.tex) && job.width > 0 && job.height > 0 && !job.dxtBytes.empty()) {
-			ready.bgra8.resize((size_t)job.width * (size_t)job.height * 4u);
-			DecodeDxtToBgra8(job.fmt, job.dxtBytes.data(), job.srcPitch,
-			                 ready.bgra8.data(), (int)(job.width * 4u), job.width, job.height);
+			bool cached = false;
+			if (job.compressedMipCache)
+				cached = LoadDxtMipChain(job.fmt, job.width, job.height, job.srcPitch, job.dxtBytes, ready.compressed);
+			if (cached) {
+				static volatile LONG firstHit = 0;
+				if (InterlockedExchange(&firstHit, 1) == 0) Log("Mipmaps: loaded cached DXT mip chain");
+			} else {
+				ready.bgra8.resize((size_t)job.width * (size_t)job.height * 4u);
+				DecodeDxtToBgra8(job.fmt, job.dxtBytes.data(), job.srcPitch,
+				                 ready.bgra8.data(), (int)(job.width * 4u), job.width, job.height);
+				if (job.compressedMipCache)
+					BuildDxtMipChain(job.fmt, job.width, job.height, job.srcPitch, job.dxtBytes,
+					                 std::move(ready.bgra8), ready.compressed);
+			}
 		}
 
 		AcquireSRWLockExclusive(&g_mipLock);
@@ -1075,7 +1092,7 @@ static void EnqueueAsyncDxtMip(PendingDxtJob &&job)
 static void ApplyDecodedMipToTexture(ManagedTexture9 *tex, IDirect3DDevice9Ex *devEx,
                                      UINT w, UINT h, uint32_t gen, const std::vector<uint8_t> &bgra8)
 {
-	if (!tex || !devEx || bgra8.empty() || !tex->HasExternalRefs() || tex->MipGen() != gen)
+	if (!tex || !devEx || bgra8.empty() || !tex->HasExternalRefs() || !tex->CanApplyMip(gen))
 		return;
 
 	// Ensure reusable SYSTEMMEM staging surface is at least w x h (zero per-texture allocation churn!)
@@ -1122,6 +1139,51 @@ static void ApplyDecodedMipToTexture(ManagedTexture9 *tex, IDirect3DDevice9Ex *d
 	mipTex->Release();
 }
 
+static bool ApplyCompressedMipToTexture(const ReadyMipJob &job)
+{
+	IDirect3DTexture9 *source = nullptr;
+	if (FAILED(job.devEx->CreateTexture(job.width, job.height, 0, 0, job.fmt, D3DPOOL_SYSTEMMEM, &source, nullptr)))
+		return false;
+
+	const UINT levels = source->GetLevelCount();
+	size_t offset = 0;
+	UINT w = job.width, h = job.height;
+	bool uploaded = true;
+	for (UINT level = 0; level < levels; ++level) {
+		const UINT pitch = ((w + 3) / 4) * DxtBlockBytes(job.fmt);
+		const UINT rows = (h + 3) / 4;
+		const size_t size = (size_t)pitch * rows;
+		D3DLOCKED_RECT rect = {};
+		if (offset + size > job.compressed.size() || FAILED(source->LockRect(level, &rect, nullptr, 0))) {
+			uploaded = false;
+			break;
+		}
+		if (!rect.pBits || rect.Pitch < (INT)pitch) {
+			source->UnlockRect(level);
+			uploaded = false;
+			break;
+		}
+		for (UINT row = 0; row < rows; ++row)
+			memcpy((uint8_t *)rect.pBits + (size_t)row * rect.Pitch, job.compressed.data() + offset + (size_t)row * pitch, pitch);
+		source->UnlockRect(level);
+		offset += size;
+		w = w > 1 ? w / 2 : 1;
+		h = h > 1 ? h / 2 : 1;
+	}
+	IDirect3DTexture9 *dest = nullptr;
+	uploaded = uploaded && offset == job.compressed.size() && SUCCEEDED(job.devEx->CreateTexture(job.width, job.height, levels,
+	           0, job.fmt, D3DPOOL_DEFAULT, &dest, nullptr)) && SUCCEEDED(job.devEx->UpdateTexture(source, dest));
+	source->Release();
+	if (uploaded) {
+		job.tex->SwapToMipmappedGpuTex(dest, job.gen);
+		static bool logged = false;
+		if (!logged) { logged = true; Log("Mipmaps: compressed DXT chain uploaded to GPU"); }
+	} else if (dest) {
+		dest->Release();
+	}
+	return uploaded;
+}
+
 void DrainAsyncMipUploads(int maxPerFrame)
 {
 	if (maxPerFrame <= 0) maxPerFrame = 4;
@@ -1136,6 +1198,22 @@ void DrainAsyncMipUploads(int maxPerFrame)
 		g_mipReady.pop_front();
 		ReleaseSRWLockExclusive(&g_mipLock);
 
+		if (!job.compressed.empty() && job.tex->HasExternalRefs() && job.tex->CanApplyMip(job.gen)) {
+			if (!ApplyCompressedMipToTexture(job)) {
+				PendingDxtJob fallback;
+				fallback.tex = job.tex;
+				fallback.devEx = job.devEx;
+				fallback.width = job.width;
+				fallback.height = job.height;
+				fallback.fmt = job.fmt;
+				fallback.srcPitch = (int)(((job.width + 3) / 4) * DxtBlockBytes(job.fmt));
+				fallback.gen = job.gen;
+				job.compressed.resize(DxtLevelBytes(job.fmt, job.width, job.height));
+				fallback.dxtBytes = std::move(job.compressed);
+				EnqueueAsyncDxtMip(std::move(fallback));
+				continue;
+			}
+		}
 		ApplyDecodedMipToTexture(job.tex, job.devEx, job.width, job.height, job.gen, job.bgra8);
 		ReleaseManagedTexRef(job.tex);
 	}

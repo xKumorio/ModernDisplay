@@ -32,7 +32,13 @@ call "%VSDIR%\VC\Auxiliary\Build\vcvars32.bat" >nul || exit /b 1
 cd /d "%~dp0"
 if not exist build\obj mkdir build\obj
 
-cl /nologo /MP /c /O2 /MT /EHsc /W4 /WX- /std:c++20 /utf-8 /DNDEBUG /DNOMINMAX /Isrc /Fobuild\obj\ ^
+set "MD_FXC=fxc.exe"
+if exist "%WindowsSdkVerBinPath%x64\fxc.exe" set "MD_FXC=%WindowsSdkVerBinPath%x64\fxc.exe"
+"%MD_FXC%" /nologo /WX /O3 /T ps_2_0 /E main /Vn kPlayerMaterialPS /Fh build\obj\player_material_bc.h src\gfx\shaders\player_material.hlsl || exit /b 1
+"%MD_FXC%" /nologo /WX /O3 /T ps_4_0 /E main /Vn kRoadPuddlesPS /Fh build\obj\road_puddles_bc.h src\gfx\shaders\road_puddles.hlsl || exit /b 1
+"%MD_FXC%" /nologo /WX /O3 /T ps_5_0 /E main /Vn kAoReusePS /Fh build\obj\ao_reuse_bc.h src\gfx\shaders\ao_reuse.hlsl || exit /b 1
+
+cl /nologo /MP /c /O2 /MT /EHsc /W4 /WX- /std:c++20 /utf-8 /DNDEBUG /DNOMINMAX /Isrc /Ibuild\obj /Fobuild\obj\ ^
 	src\main.cpp src\core\*.cpp src\gfx\*.cpp || exit /b 1
 
 link /nologo /DLL "/OUT:build\ModernDisplay.asi" build\obj\*.obj ^

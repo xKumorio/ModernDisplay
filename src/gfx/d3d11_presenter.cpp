@@ -1,10 +1,13 @@
 // ModernDisplay - Copyright (c) 2026 Softik Inquisitor (https://vk.ru/miurawr). All rights reserved.
 #include "d3d11_presenter.h"
 #include "blit_bc.h"
+#include "road_puddles_bc.h"
+#include "ao_reuse_bc.h"
 #include "lut_loader.h"
 #include "../core/log.h"
 #include "../core/scheduler.h"
 
+#include <algorithm>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -75,8 +78,12 @@ struct SsrCBData {
 	uint32_t quality;
 	float    skyBot[3];
 	float    timeSec;
+	float    roadGridOrigin[2];
+	float    roadGridSpacing;
+	float    unknownMaterialOffset;
+	float    actorCrop[4], actorGround[4];
 };
-static_assert(sizeof(SsrCBData) == 192, "SsrCBData must match SsrParams cbuffer");
+static_assert(sizeof(SsrCBData) == 240, "SsrCBData must match SsrParams cbuffer");
 
 struct BloomCBData {
 	float    invSrcW;
@@ -475,6 +482,11 @@ bool D3D11Presenter::Init(HWND hwnd, UINT swapW, UINT swapH, LUID adapterLuid, b
 	qd.Query = D3D11_QUERY_EVENT;
 	for (int i = 0; i < kNumSlots; ++i)
 		m_dev->CreateQuery(&qd, &m_slotQuery[i]);
+	if (m_slotQuery[0] && m_slotQuery[1] && SUCCEEDED(m_dev->QueryInterface(IID_PPV_ARGS(&m_queueDevice)))) {
+		for (HANDLE &event : m_slotReady)
+			event = CreateEventW(nullptr, TRUE, TRUE, nullptr);
+		if (!m_slotReady[0] || !m_slotReady[1]) SafeRelease(m_queueDevice);
+	}
 
 	m_reflex.Init(m_dev, m_ctx, m_swapChain2, m_waitableObj, vendorId, g_cfg.reflex);
 	m_appliedCfgSeq = InterlockedCompareExchange(&g_cfgSeq, 0, 0);
@@ -497,6 +509,7 @@ bool D3D11Presenter::Init(HWND hwnd, UINT swapW, UINT swapH, LUID adapterLuid, b
 
 void D3D11Presenter::Shutdown()
 {
+	DrainAsync();
 	if (m_thread) {
 		EnterCriticalSection(&m_asyncCs);
 		m_stopThread = true;
@@ -536,6 +549,9 @@ void D3D11Presenter::Shutdown()
 	SafeRelease(m_ssgiPS);
 	SafeRelease(m_ssrCB);
 	SafeRelease(m_ssrBlurPS);
+	SafeRelease(m_roadPuddlesPS);
+	SafeRelease(m_roadGridSrv);
+	SafeRelease(m_roadGridTexture);
 	SafeRelease(m_ssrPS);
 	SafeRelease(m_smaaCB);
 	SafeRelease(m_smaaWeightPS);
@@ -548,10 +564,17 @@ void D3D11Presenter::Shutdown()
 	SafeRelease(m_aoBlurPS);
 	SafeRelease(m_aoDenoise2dPS);
 	SafeRelease(m_aoPS);
+	SafeRelease(m_markReused);
+	SafeRelease(m_traceMissing);
+	SafeRelease(m_aoReusePS);
 	SafeRelease(m_aoDepthMipPS);
 	SafeRelease(m_aoDepthLinPS);
-	for (int i = 0; i < kNumSlots; ++i)
+	SafeRelease(m_queueDevice);
+	for (int i = 0; i < kNumSlots; ++i) {
 		SafeRelease(m_slotQuery[i]);
+		if (m_slotReady[i]) CloseHandle(m_slotReady[i]);
+		m_slotReady[i] = nullptr;
+	}
 
 	SafeRelease(m_fontSrv);
 	SafeRelease(m_fontTex);
@@ -654,6 +677,21 @@ bool D3D11Presenter::CreateAoPipeline()
 	if (FAILED(m_dev->CreatePixelShader(kAoDepthLinPS, sizeof(kAoDepthLinPS), nullptr, &m_aoDepthLinPS))) return false;
 	if (FAILED(m_dev->CreatePixelShader(kAoDepthMipPS, sizeof(kAoDepthMipPS), nullptr, &m_aoDepthMipPS))) return false;
 	if (FAILED(m_dev->CreatePixelShader(kAoPS, sizeof(kAoPS), nullptr, &m_aoPS))) return false;
+	if (m_dev->GetFeatureLevel() >= D3D_FEATURE_LEVEL_11_0 &&
+	    SUCCEEDED(m_dev->CreatePixelShader(kAoReusePS, sizeof(kAoReusePS), nullptr, &m_aoReusePS))) {
+		D3D11_DEPTH_STENCIL_DESC ds = {};
+		ds.DepthFunc = D3D11_COMPARISON_ALWAYS;
+		ds.StencilEnable = TRUE;
+		ds.StencilReadMask = ds.StencilWriteMask = 1;
+		ds.FrontFace = { D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_REPLACE, D3D11_COMPARISON_ALWAYS };
+		ds.BackFace = ds.FrontFace;
+		m_dev->CreateDepthStencilState(&ds, &m_markReused);
+		ds.StencilWriteMask = 0;
+		ds.FrontFace.StencilPassOp = D3D11_STENCIL_OP_KEEP;
+		ds.FrontFace.StencilFunc = D3D11_COMPARISON_EQUAL;
+		ds.BackFace = ds.FrontFace;
+		m_dev->CreateDepthStencilState(&ds, &m_traceMissing);
+	}
 	if (FAILED(m_dev->CreatePixelShader(kAoDenoise2dPS, sizeof(kAoDenoise2dPS), nullptr, &m_aoDenoise2dPS))) return false;
 	if (FAILED(m_dev->CreatePixelShader(kAoBlurPS, sizeof(kAoBlurPS), nullptr, &m_aoBlurPS))) return false;
 	if (FAILED(m_dev->CreatePixelShader(kAoTemporalPS, sizeof(kAoTemporalPS), nullptr, &m_aoTemporalPS))) return false;
@@ -834,6 +872,11 @@ void D3D11Presenter::ReleaseAoTargets()
 	SafeRelease(m_aoTmpRtv);
 	SafeRelease(m_aoTmpTex);
 	SafeRelease(m_aoRawSrv);
+	SafeRelease(m_aoStencil);
+	SafeRelease(m_prevRawTex);
+	SafeRelease(m_prevRawRtv);
+	SafeRelease(m_prevRawSrv);
+	m_prevRawQuality = 0;
 	SafeRelease(m_aoRawRtv);
 	SafeRelease(m_aoRawTex);
 	m_aoW = m_aoH = 0;
@@ -873,6 +916,15 @@ bool D3D11Presenter::EnsureAoTargets(UINT w, UINT h)
 		return false;
 	}
 	m_aoW = w;
+	if (m_markReused && m_traceMissing && makeTarget(m_prevRawTex, m_prevRawRtv, m_prevRawSrv)) {
+		td.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+		td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+		ID3D11Texture2D *stencil = nullptr;
+		if (SUCCEEDED(m_dev->CreateTexture2D(&td, nullptr, &stencil))) {
+			m_dev->CreateDepthStencilView(stencil, nullptr, &m_aoStencil);
+			stencil->Release();
+		}
+	}
 	m_aoH = h;
 	return true;
 }
@@ -929,7 +981,31 @@ void D3D11Presenter::RenderXeGtao(int slot, int quality, float strength, const f
 		cb->padAo        = 0.0f;
 		m_ctx->Unmap(m_aoCB, 0);
 	}
-	m_ctx->OMSetRenderTargets(1, &m_aoRawRtv, nullptr);
+	bool reuse = m_aoStencil && canTemporal && useHist && !halfRes &&
+	             quality == m_prevRawQuality && strength == m_prevRawStrength;
+	if (reuse) {
+		reuse = SUCCEEDED(m_ctx->Map(m_aoTemporalCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms));
+		if (reuse) {
+			auto *cb = static_cast<AoTemporalCBData *>(ms.pData);
+			memcpy(cb->currToPrevClip, reProj, sizeof(cb->currToPrevClip));
+			cb->invAoW = 1.0f / aoW; cb->invAoH = 1.0f / aoH;
+			cb->prevNearZ = m_prevNearZ; cb->prevFarZ = m_prevFarZ;
+			memcpy(&cb->padTemp, &m_aoFrameIdx, sizeof(m_aoFrameIdx));
+			m_ctx->Unmap(m_aoTemporalCB, 0);
+			m_ctx->ClearDepthStencilView(m_aoStencil, D3D11_CLEAR_STENCIL, 1, 0);
+			m_ctx->OMSetRenderTargets(1, &m_aoRawRtv, m_aoStencil);
+			m_ctx->OMSetDepthStencilState(m_markReused, 1);
+			ID3D11ShaderResourceView *sources[] = { m_prevRawSrv, m_sharedDepthSrv[slot], m_aoDepthSrv, m_aoPrevDepthSrv };
+			m_ctx->PSSetShaderResources(0, 4, sources);
+			m_ctx->PSSetConstantBuffers(0, 1, &m_aoTemporalCB);
+			m_ctx->PSSetShader(m_aoReusePS, nullptr, 0);
+			m_ctx->Draw(3, 0);
+			ID3D11ShaderResourceView *empty[4] = {};
+			m_ctx->PSSetShaderResources(0, 4, empty);
+			m_ctx->OMSetDepthStencilState(m_traceMissing, 0);
+		}
+	}
+	m_ctx->OMSetRenderTargets(1, &m_aoRawRtv, reuse ? m_aoStencil : nullptr);
 	m_ctx->PSSetShader(m_aoPS, nullptr, 0);
 	m_ctx->PSSetConstantBuffers(0, 1, &m_aoCB);
 	m_ctx->PSSetShaderResources(0, 1, &m_aoDepthSrv);
@@ -937,6 +1013,7 @@ void D3D11Presenter::RenderXeGtao(int slot, int quality, float strength, const f
 	m_ctx->PSSetShaderResources(0, 2, nullSrvs);
 
 	// Stage 2a: 2D 3x3 Diagonal-Bridging Cross-Bilateral Pre-Denoiser
+	if (reuse) m_ctx->OMSetDepthStencilState(m_dsOff, 0);
 	ID3D11SamplerState *blurSmps[2] = { m_smpPoint, m_smpLinear };
 	m_ctx->PSSetSamplers(0, 2, blurSmps);
 	ID3D11ShaderResourceView *hInputSrv = m_aoRawSrv;
@@ -1030,12 +1107,28 @@ void D3D11Presenter::RenderXeGtao(int slot, int quality, float strength, const f
 		++m_aoFrameIdx;
 		m_aoOutputSrv = m_aoHistSrv[writeIdx];
 	}
+	if (m_aoStencil) {
+		std::swap(m_aoRawTex, m_prevRawTex);
+		std::swap(m_aoRawRtv, m_prevRawRtv);
+		std::swap(m_aoRawSrv, m_prevRawSrv);
+		m_prevRawQuality = quality;
+		m_prevRawStrength = strength;
+	}
 }
 
 bool D3D11Presenter::CreateSsrPipeline()
 {
 	if (FAILED(m_dev->CreatePixelShader(kSsrPS, sizeof(kSsrPS), nullptr, &m_ssrPS))) return false;
 	if (FAILED(m_dev->CreatePixelShader(kSsrBlurPS, sizeof(kSsrBlurPS), nullptr, &m_ssrBlurPS))) return false;
+	D3D11_TEXTURE2D_DESC roadDesc = {};
+	roadDesc.Width = roadDesc.Height = kRoadGridSize;
+	roadDesc.MipLevels = roadDesc.ArraySize = roadDesc.SampleDesc.Count = 1;
+	roadDesc.Format = DXGI_FORMAT_R32_FLOAT;
+	roadDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	if (FAILED(m_dev->CreatePixelShader(kRoadPuddlesPS, sizeof(kRoadPuddlesPS), nullptr, &m_roadPuddlesPS)) ||
+	    FAILED(m_dev->CreateTexture2D(&roadDesc, nullptr, &m_roadGridTexture)) ||
+	    FAILED(m_dev->CreateShaderResourceView(m_roadGridTexture, nullptr, &m_roadGridSrv)))
+		Log("Rain: road puddle shader unavailable; using classic reflections");
 	D3D11_BUFFER_DESC cbd = {};
 	cbd.ByteWidth = sizeof(SsrCBData);
 	cbd.Usage = D3D11_USAGE_DYNAMIC;
@@ -1047,6 +1140,9 @@ bool D3D11Presenter::CreateSsrPipeline()
 
 void D3D11Presenter::ReleaseSsrTargets()
 {
+	SafeRelease(m_puddleSrv);
+	SafeRelease(m_puddleRtv);
+	m_puddleW = m_puddleH = 0;
 	SafeRelease(m_ssrTmpSrv);
 	SafeRelease(m_ssrTmpRtv);
 	SafeRelease(m_ssrTmpTex);
@@ -1084,31 +1180,56 @@ bool D3D11Presenter::EnsureSsrTargets(UINT w, UINT h)
 	return true;
 }
 
-void D3D11Presenter::RenderSsr(int slot, int quality, bool use3dTex, bool rainFx, const FrameCameraParams &cam)
+bool D3D11Presenter::EnsurePuddleTarget()
+{
+	if (m_puddleW == m_gameW && m_puddleH == m_gameH) return m_puddleSrv != nullptr;
+	m_puddleW = m_gameW;
+	m_puddleH = m_gameH;
+	SafeRelease(m_puddleSrv);
+	SafeRelease(m_puddleRtv);
+	D3D11_TEXTURE2D_DESC desc = {};
+	desc.Width = m_gameW;
+	desc.Height = m_gameH;
+	desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
+	desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+	ID3D11Texture2D *texture = nullptr;
+	if (FAILED(m_dev->CreateTexture2D(&desc, nullptr, &texture))) return false;
+	bool ok = SUCCEEDED(m_dev->CreateRenderTargetView(texture, nullptr, &m_puddleRtv)) &&
+	          SUCCEEDED(m_dev->CreateShaderResourceView(texture, nullptr, &m_puddleSrv));
+	texture->Release();
+	if (!ok) SafeRelease(m_puddleRtv);
+	return ok;
+}
+
+ID3D11ShaderResourceView *D3D11Presenter::RenderSsr(int slot, int quality, bool use3dTex, bool rainFx, const FrameCameraParams &cam)
 {
 	if (!m_ssrPS || !m_ssrCB || !m_aoDepthSrv || !cam.hasViewProj || cam.inInterior || m_gameW == 0 || m_gameH == 0)
-		return;
+		return nullptr;
 	ID3D11ShaderResourceView *colSrv = (use3dTex && m_shared3dSrv[slot]) ? m_shared3dSrv[slot] : m_sharedSrv[slot];
-	if (!colSrv) return;
+	if (!colSrv) return nullptr;
 
 	UINT ssrW = (m_gameW / 2) > 320u ? (m_gameW / 2) : 320u;
 	UINT ssrH = (m_gameH / 2) > 180u ? (m_gameH / 2) : 180u;
-	if (!EnsureSsrTargets(ssrW, ssrH)) return;
+	if (!EnsureSsrTargets(ssrW, ssrH)) return nullptr;
 
 	double viewD[16], invViewD[16], vpD[16], invVpD[16];
 	for (int k = 0; k < 16; ++k) {
 		viewD[k] = (double)cam.viewMat[k];
 		vpD[k]   = (double)cam.viewProj[k];
 	}
-	if (!Invert4x4Double(viewD, invViewD) || !Invert4x4Double(vpD, invVpD)) return;
+	if (!Invert4x4Double(viewD, invViewD) || !Invert4x4Double(vpD, invVpD)) return nullptr;
 
 	// Only wet asphalt during actual rain (prevents dry foggy/Halloween concrete from turning into mirrors!)
 	float wetAmt = 0.0f;
-	if (cam.rain > 0.05f)
+	if (cam.rain > 0.05f && !cam.sheltered)
 		wetAmt = (cam.rain > cam.wetRoads) ? cam.rain : cam.wetRoads;
-	else if (cam.wetRoads > 0.65f)
+	else if (cam.wetRoads > 0.65f && !cam.sheltered)
 		wetAmt = (cam.wetRoads - 0.65f) * 1.4f;
 	if (wetAmt > 1.0f) wetAmt = 1.0f;
+	const bool roadPuddles = rainFx && wetAmt > 0.01f && use3dTex && cam.hasRoadGrid &&
+	                         m_roadPuddlesPS && m_roadGridSrv && m_sharedDepthSrv[slot];
+	const auto &roadGrid = m_roadGrids[slot];
 
 	D3D11_MAPPED_SUBRESOURCE ms = {};
 	if (SUCCEEDED(m_ctx->Map(m_ssrCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
@@ -1129,8 +1250,15 @@ void D3D11Presenter::RenderSsr(int slot, int quality, bool use3dTex, bool rainFx
 		cb->quality    = (uint32_t)quality | (rainFx ? 256u : 0u);
 		cb->skyBot[0]  = cam.skyBot[0]; cb->skyBot[1] = cam.skyBot[1]; cb->skyBot[2] = cam.skyBot[2];
 		cb->timeSec    = (float)(GetTickCount() & 0xFFFFFu) * 0.001f;
+		cb->roadGridOrigin[0] = (float)roadGrid.originX;
+		cb->roadGridOrigin[1] = (float)roadGrid.originY;
+		cb->roadGridSpacing = kRoadGridSpacing;
+		cb->unknownMaterialOffset = kUnknownMaterialOffset;
+		memcpy(cb->actorCrop, cam.actorCrop, sizeof(cb->actorCrop));
+		memcpy(cb->actorGround, cam.actorGround, sizeof(cb->actorGround));
+		if (!m_actorSrv[slot]) cb->actorCrop[2] = 0;
 		m_ctx->Unmap(m_ssrCB, 0);
-	}
+	} else return nullptr;
 
 	D3D11_VIEWPORT vp = { 0.0f, 0.0f, (float)ssrW, (float)ssrH, 0.0f, 1.0f };
 	ID3D11SamplerState *smps[2] = { m_smpPoint, m_smpLinear };
@@ -1185,6 +1313,33 @@ void D3D11Presenter::RenderSsr(int slot, int quality, bool use3dTex, bool rainFx
 		m_ctx->Draw(3, 0);
 		m_ctx->PSSetShaderResources(0, 2, null2);
 	}
+
+	if (roadPuddles) {
+		const bool native = EnsurePuddleTarget();
+		static bool loggedRoadPuddles = false;
+		if (!loggedRoadPuddles) {
+			loggedRoadPuddles = true;
+			Log("Rain: road puddles active at %ux%u (wet=%.2f)", native ? m_gameW : ssrW, native ? m_gameH : ssrH, wetAmt);
+		}
+		m_ctx->UpdateSubresource(m_roadGridTexture, 0, nullptr, roadGrid.heights, kRoadGridSize * sizeof(float), 0);
+		ID3D11ShaderResourceView *roadSrvs[] = {
+			colSrv, m_aoDepthSrv, m_sharedDepthSrv[slot], m_roadGridSrv, m_ssrSrv, m_actorSrv[slot]
+		};
+		if (native) {
+			vp.Width = (float)m_gameW;
+			vp.Height = (float)m_gameH;
+			m_ctx->RSSetViewports(1, &vp);
+		}
+		m_ctx->OMSetRenderTargets(1, native ? &m_puddleRtv : &m_ssrTmpRtv, nullptr);
+		m_ctx->PSSetShader(m_roadPuddlesPS, nullptr, 0);
+		m_ctx->PSSetConstantBuffers(0, 1, &m_ssrCB);
+		m_ctx->PSSetShaderResources(0, ARRAYSIZE(roadSrvs), roadSrvs);
+		m_ctx->Draw(3, 0);
+		ID3D11ShaderResourceView *nullRoadSrvs[ARRAYSIZE(roadSrvs)] = {};
+		m_ctx->PSSetShaderResources(0, ARRAYSIZE(roadSrvs), nullRoadSrvs);
+		return native ? m_puddleSrv : m_ssrTmpSrv;
+	}
+	return m_ssrSrv;
 }
 
 bool D3D11Presenter::CreateSsgiPipeline()
@@ -1254,9 +1409,24 @@ void D3D11Presenter::RenderSsgi(int slot, bool use3dTex, const float reProj[16],
 	ID3D11ShaderResourceView *colSrv = (use3dTex && m_shared3dSrv[slot]) ? m_shared3dSrv[slot] : m_sharedSrv[slot];
 	if (!colSrv) return;
 
-	UINT giW = (m_gameW / 2) > 320u ? (m_gameW / 2) : 320u;
-	UINT giH = (m_gameH / 2) > 180u ? (m_gameH / 2) : 180u;
+	UINT giBaseW = m_gameW;
+	UINT giBaseH = m_gameH;
+	if (g_cfg.ssgiDisplayRes && (m_gameW > m_swapW || m_gameH > m_swapH)) {
+		float x, y, width, height;
+		ComputeDisplayViewport(m_gameW, m_gameH, m_swapW, m_swapH, g_cfg.scaling, x, y, width, height);
+		giBaseW = (std::min)(giBaseW, (UINT)width);
+		giBaseH = (std::min)(giBaseH, (UINT)height);
+	}
+	const UINT giW = (std::max)(320u, giBaseW / 2);
+	const UINT giH = (std::max)(180u, giBaseH / 2);
+	const float depthMip = (giBaseW == m_gameW && giBaseH == m_gameH) ? 1.0f :
+	                      log2f((std::max)((float)m_gameW / giW, (float)m_gameH / giH));
 	if (!EnsureSsgiTargets(giW, giH)) return;
+	static bool loggedDisplayRes = false;
+	if (!loggedDisplayRes && g_cfg.ssgiDisplayRes && (giBaseW != m_gameW || giBaseH != m_gameH)) {
+		loggedDisplayRes = true;
+		Log("SSGI: display-resolution target %ux%u (game %ux%u, depth mip %.2f)", giW, giH, m_gameW, m_gameH, depthMip);
+	}
 
 	D3D11_VIEWPORT vp = { 0.0f, 0.0f, (float)giW, (float)giH, 0.0f, 1.0f };
 	ID3D11ShaderResourceView *null5[5] = {};
@@ -1281,7 +1451,7 @@ void D3D11Presenter::RenderSsgi(int slot, bool use3dTex, const float reProj[16],
 		cb->radiusWorld  = 7.5f;
 		cb->strength     = 1.0f;
 		cb->quality      = 1u;
-		cb->depthBaseMip = 1.0f;
+		cb->depthBaseMip = depthMip;
 		cb->frameIndex   = m_ssgiFrameIdx;
 		cb->padAo        = 0.0f;
 		m_ctx->Unmap(m_aoCB, 0);
@@ -1305,7 +1475,7 @@ void D3D11Presenter::RenderSsgi(int slot, bool use3dTex, const float reProj[16],
 	if (SUCCEEDED(m_ctx->Map(m_aoBlurCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
 		auto *cb = (AoBlurCBData *)ms.pData;
 		cb->texelStepX = 1.0f / (float)giW; cb->texelStepY = 0.0f;
-		cb->depthBaseMip = 1.0f; cb->edgeSharpness = 1.0f;
+		cb->depthBaseMip = depthMip; cb->edgeSharpness = 1.0f;
 		cb->padBlur[0] = cb->padBlur[1] = cb->padBlur[2] = cb->padBlur[3] = 0.0f;
 		m_ctx->Unmap(m_aoBlurCB, 0);
 	}
@@ -1318,7 +1488,7 @@ void D3D11Presenter::RenderSsgi(int slot, bool use3dTex, const float reProj[16],
 	if (SUCCEEDED(m_ctx->Map(m_aoBlurCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
 		auto *cb = (AoBlurCBData *)ms.pData;
 		cb->texelStepX = 0.0f; cb->texelStepY = 1.0f / (float)giH;
-		cb->depthBaseMip = 1.0f; cb->edgeSharpness = 1.0f;
+		cb->depthBaseMip = depthMip; cb->edgeSharpness = 1.0f;
 		cb->padBlur[0] = cb->padBlur[1] = cb->padBlur[2] = cb->padBlur[3] = 0.0f;
 		m_ctx->Unmap(m_aoBlurCB, 0);
 	}
@@ -1340,7 +1510,7 @@ void D3D11Presenter::RenderSsgi(int slot, bool use3dTex, const float reProj[16],
 			cb->invAoH       = 1.0f / (float)giH;
 			cb->prevNearZ    = m_prevNearZ;
 			cb->prevFarZ     = m_prevFarZ;
-			cb->depthBaseMip = 1.0f;
+			cb->depthBaseMip = depthMip;
 			cb->hasHistory   = (useHist && m_ssgiHasHist) ? 1u : 0u;
 			cb->blendWeight  = 0.86f;
 			cb->padTemp      = 0.0f;
@@ -1941,8 +2111,8 @@ void D3D11Presenter::UnbindSharedTextures()
 {
 	DrainAsync();
 	if (m_ctx) {
-		ID3D11ShaderResourceView *nullSrvs[10] = {};
-		m_ctx->PSSetShaderResources(0, 10, nullSrvs);
+		ID3D11ShaderResourceView *nullSrvs[11] = {};
+		m_ctx->PSSetShaderResources(0, ARRAYSIZE(nullSrvs), nullSrvs);
 		m_ctx->Flush();
 	}
 	for (int i = 0; i < kNumSlots; ++i) {
@@ -1950,6 +2120,8 @@ void D3D11Presenter::UnbindSharedTextures()
 		SafeRelease(m_sharedTex[i]);
 		SafeRelease(m_shared3dSrv[i]);
 		SafeRelease(m_shared3dTex[i]);
+		SafeRelease(m_actorSrv[i]);
+		SafeRelease(m_actorTex[i]);
 		SafeRelease(m_sharedDepthSrv[i]);
 		SafeRelease(m_sharedDepthTex[i]);
 	}
@@ -1957,7 +2129,7 @@ void D3D11Presenter::UnbindSharedTextures()
 
 bool D3D11Presenter::BindSharedTextures(const HANDLE colorHandles[kNumSlots],
                                         const HANDLE world3dHandles[kNumSlots],
-                                        const HANDLE depthHandles[kNumSlots],
+                                        const HANDLE depthHandles[kNumSlots], const HANDLE actorHandles[kNumSlots],
                                         UINT gameW, UINT gameH)
 {
 	UnbindSharedTextures();
@@ -1984,6 +2156,8 @@ bool D3D11Presenter::BindSharedTextures(const HANDLE colorHandles[kNumSlots],
 		}
 		if (world3dHandles && world3dHandles[i])
 			openSlot(world3dHandles[i], m_shared3dTex[i], m_shared3dSrv[i]);
+		if (actorHandles && actorHandles[i])
+			openSlot(actorHandles[i], m_actorTex[i], m_actorSrv[i]);
 		if (depthHandles && depthHandles[i])
 			openSlot(depthHandles[i], m_sharedDepthTex[i], m_sharedDepthSrv[i]);
 	}
@@ -2077,10 +2251,21 @@ bool D3D11Presenter::UploadGammaIfDirty()
 void D3D11Presenter::WaitForSlot(int slot)
 {
 	if (!m_asyncCsInit || slot < 0 || slot >= kNumSlots) return;
+	if (m_queueDevice) {
+		while (WaitForSingleObject(m_slotReady[slot], 100) == WAIT_TIMEOUT) {
+			if (FAILED(m_dev->GetDeviceRemovedReason())) break;
+		}
+		return;
+	}
 	EnterCriticalSection(&m_asyncCs);
 	while (m_slotBusy[slot] && !m_stopThread)
 		SleepConditionVariableCS(&m_cvDone, &m_asyncCs, 50);
 	LeaveCriticalSection(&m_asyncCs);
+}
+
+bool D3D11Presenter::CanShareRenderTargets() const
+{
+	return m_thread && m_slotQuery[0] && m_slotQuery[1];
 }
 
 void D3D11Presenter::DrainAsync()
@@ -2090,11 +2275,13 @@ void D3D11Presenter::DrainAsync()
 	while ((m_queued.slot >= 0 || m_inFlight) && !m_stopThread)
 		SleepConditionVariableCS(&m_cvDone, &m_asyncCs, 50);
 	LeaveCriticalSection(&m_asyncCs);
+	if (m_queueDevice)
+		for (int slot = 0; slot < kNumSlots; ++slot) WaitForSlot(slot);
 }
 
 void D3D11Presenter::SubmitFrame(int slot, uint64_t frameId, bool async, bool isMinimized,
                                  int64_t inputSampleQpc, bool has3dMask, bool hasDepth,
-                                 const FrameCameraParams *cam)
+                                 const FrameCameraParams *cam, bool frontEnd)
 {
 	if (!m_swapChain || !m_backBuffer || slot < 0 || slot >= kNumSlots || !m_sharedTex[slot])
 		return;
@@ -2106,6 +2293,7 @@ void D3D11Presenter::SubmitFrame(int slot, uint64_t frameId, bool async, bool is
 	}
 
 	QueuedFrame qf = {};
+	qf.frontEnd  = frontEnd;
 	qf.slot      = slot;
 	qf.frameId   = frameId;
 	qf.inputQpc  = inputSampleQpc;
@@ -2119,11 +2307,13 @@ void D3D11Presenter::SubmitFrame(int slot, uint64_t frameId, bool async, bool is
 		while (m_queued.slot >= 0 && !m_stopThread)
 			SleepConditionVariableCS(&m_cvDone, &m_asyncCs, 50);
 		m_slotBusy[slot] = true;
+		if (m_queueDevice) ResetEvent(m_slotReady[slot]);
 		m_queued = qf;
 		WakeConditionVariable(&m_cvWork);
 		LeaveCriticalSection(&m_asyncCs);
 	} else {
 		DrainAsync();
+		if (m_queueDevice) ResetEvent(m_slotReady[slot]);
 		PresentSlotOnD3D11(qf);
 	}
 }
@@ -2154,17 +2344,6 @@ void D3D11Presenter::ThreadLoop()
 		LeaveCriticalSection(&m_asyncCs);
 
 		PresentSlotOnD3D11(qf);
-
-		// Wait until D3D11 GPU finishes reading m_sharedTex[qf.slot] / depth before D3D9 can reuse the slot.
-		if (qf.slot >= 0 && qf.slot < kNumSlots && m_slotQuery[qf.slot] && m_ctx) {
-			BOOL done = FALSE;
-			DWORD tStart = GetTickCount();
-			while (!m_stopThread && m_ctx->GetData(m_slotQuery[qf.slot], &done, sizeof(done), 0) == S_FALSE) {
-				if ((GetTickCount() - tStart) >= 20)
-					break;
-				SwitchToThread();
-			}
-		}
 
 		EnterCriticalSection(&m_asyncCs);
 		m_slotBusy[qf.slot] = false;
@@ -2327,24 +2506,25 @@ void D3D11Presenter::PresentSlotOnD3D11(const QueuedFrame &qf)
 
 	bool gammaActive = g_cfg.gammaLut && UploadGammaIfDirty();
 	ScalingMode scaleMode = g_cfg.scaling;
-	float sharp = g_cfg.sharpness;
-	float vib = g_cfg.vibrance;
+	const bool world = !qf.frontEnd;
+	float sharp = world ? g_cfg.sharpness : 0.0f;
+	float vib = world ? g_cfg.vibrance : 0;
 	bool overlay = g_cfg.overlay;
-	bool deband = g_cfg.deband;
+	bool deband = world && g_cfg.deband;
 	int aoQuality = g_cfg.aoQuality;
 	float aoStrength = g_cfg.aoStrength;
-	int aaQuality = g_cfg.aaQuality;
+	int aaQuality = world ? g_cfg.aaQuality : 0;
 	int ssrQuality = g_cfg.ssrQuality;
 	float giStr = g_cfg.giStrength;
-	bool rainFx = g_cfg.rainFx;
-	float bloomStr = g_cfg.bloomStrength;
+	bool rainFx = world && g_cfg.rainFx;
+	float bloomStr = world ? g_cfg.bloomStrength : 0;
 	bool bloomFlare = g_cfg.bloomFlare;
-	float fogStr = g_cfg.fogStrength;
-	int tonemapMode = g_cfg.tonemapMode;
-	float clarity = g_cfg.clarity;
-	bool has3dMask = qf.has3dMask && (m_shared3dSrv[slot] != nullptr) && g_cfg.depthCas;
-	bool hasLut = (m_lutSrv != nullptr && m_lutSize >= 2.0f);
-	bool hasDepth = qf.hasDepth && (m_sharedDepthSrv[slot] != nullptr);
+	float fogStr = world ? g_cfg.fogStrength : 0;
+	int tonemapMode = world ? g_cfg.tonemapMode : 0;
+	float clarity = world ? g_cfg.clarity : 0;
+	bool has3dMask = world && qf.has3dMask && m_shared3dSrv[slot] && (g_cfg.depthCas || (rainFx && qf.cam.hasRoadGrid));
+	bool hasLut = world && (m_lutSrv != nullptr && m_lutSize >= 2.0f);
+	bool hasDepth = world && qf.hasDepth && (m_sharedDepthSrv[slot] != nullptr);
 
 	bool wantAo    = (aoQuality > 0 && hasDepth && m_aoPS != nullptr);
 	bool wantSsr   = (ssrQuality > 0 && hasDepth && qf.cam.hasViewProj && !qf.cam.inInterior && m_ssrPS != nullptr);
@@ -2383,11 +2563,13 @@ void D3D11Presenter::PresentSlotOnD3D11(const QueuedFrame &qf)
 
 	if (wantAo && depthPyrReady)
 		RenderXeGtao(slot, aoQuality, aoStrength, reProjF, useTempHist, qf.cam);
+	else
+		m_prevRawQuality = 0;
 	bool hasAo = wantAo && depthPyrReady && (m_aoOutputSrv != nullptr);
 
-	if (wantSsr && depthPyrReady)
-		RenderSsr(slot, ssrQuality, has3dMask, rainFx, qf.cam);
-	bool hasSsr = wantSsr && depthPyrReady && (m_ssrSrv != nullptr);
+	ID3D11ShaderResourceView *ssrOutput = (wantSsr && depthPyrReady) ?
+		RenderSsr(slot, ssrQuality, has3dMask, rainFx, qf.cam) : nullptr;
+	bool hasSsr = ssrOutput != nullptr;
 
 	if (wantSsgi && depthPyrReady)
 		RenderSsgi(slot, has3dMask, reProjF, useTempHist, qf.cam);
@@ -2427,17 +2609,22 @@ void D3D11Presenter::PresentSlotOnD3D11(const QueuedFrame &qf)
 
 	// Screen raindrops intensity: strictly in real outdoor rain, attenuated gently when looking straight down
 	float rainDropAmt = 0.0f;
-	if (rainFx && !qf.cam.inInterior && qf.cam.rain > 0.08f) {
+	if (rainFx && g_cfg.rainLensDrops && !qf.cam.inInterior && !qf.cam.sheltered && qf.cam.rain > 0.08f) {
 		float pitchGate = (qf.cam.camPitchZ + 0.60f) / 0.85f;
 		if (pitchGate < 0.15f) pitchGate = 0.15f;
 		if (pitchGate > 1.0f)  pitchGate = 1.0f;
-		rainDropAmt = qf.cam.rain * pitchGate;
+		rainDropAmt = qf.cam.rain * pitchGate * 0.70f;
 		if (rainDropAmt > 1.0f) rainDropAmt = 1.0f;
 	}
 	bool hasRainDrops = (rainDropAmt > 0.04f);
+	static bool loggedRainDrops = false;
+	if (hasRainDrops && !loggedRainDrops) {
+		loggedRainDrops = true;
+		Log("Rain: lens droplets active (depth=%d)", hasDepth);
+	}
 
 	// Live Before/After split-screen wipe position (0..1 within active viewport, < 0 when OFF)
-	int compareMode = g_cfg.compareMode;
+	int compareMode = world ? g_cfg.compareMode : 0;
 	float compareSplitNorm = -1.0f;
 	if (compareMode == 1) {
 		compareSplitNorm = g_cfg.comparePos;
@@ -2560,7 +2747,7 @@ void D3D11Presenter::PresentSlotOnD3D11(const QueuedFrame &qf)
 			hasLut ? m_lutSrv : nullptr,
 			hasSmaa ? m_smaaWeightSrv : nullptr,
 			hasDepth ? m_sharedDepthSrv[slot] : nullptr,
-			hasSsr ? m_ssrSrv : nullptr,
+			ssrOutput,
 			hasBloom ? m_bloomUpSrv[0] : nullptr,
 			hasTaa ? m_taaOutputSrv : nullptr,
 			hasSsgi ? m_ssgiOutputSrv : nullptr,
@@ -2585,6 +2772,8 @@ void D3D11Presenter::PresentSlotOnD3D11(const QueuedFrame &qf)
 	}
 	if (m_slotQuery[slot])
 		m_ctx->End(m_slotQuery[slot]);
+	// The overlay, Present and telemetry only use private D3D11 resources.
+	const bool signaledByGpu = m_queueDevice && SUCCEEDED(m_queueDevice->EnqueueSetEvent(m_slotReady[slot]));
 
 	if (overlay || compareSplitPx >= 0.0f)
 		RenderHudOverlay(overlay, compareSplitPx);
@@ -2599,6 +2788,12 @@ void D3D11Presenter::PresentSlotOnD3D11(const QueuedFrame &qf)
 		hr = m_swapChain->Present(0, 0);
 	m_reflex.MarkFrame(qf.frameId, RM_PRESENT_END);
 	m_reflex.OnPresentFinished();
+	if (!signaledByGpu && m_slotQuery[slot]) {
+		BOOL done = FALSE;
+		while (m_ctx->GetData(m_slotQuery[slot], &done, sizeof(done), 0) == S_FALSE)
+			SwitchToThread();
+		if (m_queueDevice) SetEvent(m_slotReady[slot]);
+	}
 
 	if ((hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) && !m_deviceLostLogged) {
 		m_deviceLostLogged = true;

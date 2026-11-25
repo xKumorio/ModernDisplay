@@ -16,10 +16,13 @@ enum class ScalingMode : int {
 };
 
 struct DisplayConfig {
+	bool        english         = false; // [Language] 0 = Russian, 1 = English (rewrites INI comments on launch)
 	ReflexMode  reflex          = ReflexMode::Boost;
 	bool        asyncPresent    = true;
+	bool        directRenderTargets = false;
 	bool        stateCache      = true;
 	bool        smartManaged    = true;
+	bool        compressedMipCache = false;
 	bool        asyncScreenshot = true;
 	int         fpsLimit        = 0;    // 0 = off, -1 = auto (Hz - 3 for VRR), >0 = exact FPS cap
 	int         bgFpsLimit      = 30;   // 0 = off, >0 = FPS cap when unfocused / minimized
@@ -28,7 +31,11 @@ struct DisplayConfig {
 	int         aaQuality       = 0;    // 0 = off, 1 = SMAA 1x Med, 2 = SMAA 1x High, 3 = SMAA T2x (Temporal AA)
 	int         ssrQuality      = 0;    // 0 = off, 1 = Med (water + rain wet roads), 2 = High (32-step SSR)
 	float       giStrength      = 0.0f; // 0.00..1.00 Temporal Screen-Space Global Illumination (SSGI color bounce)
+	bool        ssgiDisplayRes  = false;
 	bool        rainFx          = false;// Animated rain ripples on SSR puddles + screen water droplets in rain
+	bool        rainLensDrops   = true;
+	bool        rainLighting    = false;
+	int         wheelSpray      = 1;    // 0 = off, 1 = original, 2 = reduced spray in standing water
 	float       bloomStrength   = 0.0f; // 0.00..1.00 3D-only Dual-Kawase HDR Bloom
 	bool        bloomFlare      = false;// Subtle anamorphic lens flare on bright headlights/sun (3D-only)
 	float       fogStrength     = 0.0f; // 0.00..1.00 Volumetric Aerial Perspective / Depth Fog (auto-off in interiors)
@@ -74,6 +81,8 @@ struct DisplayTelemetry {
 
 extern DisplayConfig g_cfg;
 extern volatile LONG g_cfgSeq;
+
+inline const char *MdTr(const char *ru, const char *en) { return g_cfg.english ? en : ru; }
 
 void ConfigLoad();
 void ConfigSave();

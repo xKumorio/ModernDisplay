@@ -225,6 +225,32 @@ static BOOL WINAPI hkClipCursor(const RECT *lpRect)
 
 static DWORD g_origGameProcess = 0;
 static DWORD g_origRenderEffects = 0;
+static DWORD g_origWheelSpray = 0;
+static DWORD g_origClumpRender = 0;
+static void *__cdecl hkEntityClumpRender(void *clump)
+{
+	auto render = reinterpret_cast<RenderRwObject>(g_origClumpRender);
+	if (g_cfg.rainFx && g_cfg.ssrQuality) {
+		const BYTE *player = *reinterpret_cast<const BYTE *const *>(0xB6F5F0);
+		if (player && *reinterpret_cast<void *const *>(player + 0x18) == clump)
+			return RenderPlayerClump(clump, render);
+	}
+	return render(clump);
+}
+
+static DWORD g_origWeaponAtomicRender = 0;
+static void *__cdecl hkWeaponAtomicRender(void *atomic)
+{
+	auto render = reinterpret_cast<RenderRwObject>(g_origWeaponAtomicRender);
+	const BYTE *player = *reinterpret_cast<const BYTE *const *>(0xB6F5F0);
+	const void *owner = *reinterpret_cast<void *const *>(static_cast<const BYTE *>(atomic) + 0x3C);
+	if (player && owner && *reinterpret_cast<void *const *>(player + 0x4F4) == owner)
+		return RenderEquippedAtomic(atomic, render);
+	return render(atomic);
+}
+
+static DWORD g_origRainHaze = 0;
+static DWORD g_origRainSplash = 0;
 
 static void __cdecl hkGameProcess()
 {
@@ -236,6 +262,109 @@ static void __cdecl hkRenderEffects()
 {
 	((void(__cdecl *)())g_origRenderEffects)();
 	NotifyBefore2dStuff();
+}
+
+struct WheelPosition {
+	float x, y, z;
+};
+
+// GTA SA 1.0 US, FxPrtMult_c and the position overload of FxSystem_c::AddParticle.
+struct RainParticleMult {
+	float red, green, blue, alpha, size, rotation, life;
+};
+using AddRainParticle = void(__thiscall *)(void *, WheelPosition *, WheelPosition *, float,
+                                          RainParticleMult *, float, float, float, unsigned char);
+
+struct RainParticleBudget {
+	DWORD lastTick = 0;
+	float credits = 1.0f;
+
+	bool Take(float perSecond, float burst)
+	{
+		const DWORD now = GetTickCount();
+		if (now != lastTick) {
+			const float replenished = credits + (now - lastTick) * (perSecond * .001f);
+			credits = replenished < burst ? replenished : burst;
+			lastTick = now;
+		}
+		if (credits < 1.0f) return false;
+		credits -= 1.0f;
+		return true;
+	}
+};
+
+static void __fastcall hkRainHaze(void *fx, void *, WheelPosition *pos, WheelPosition *velocity,
+                                 float age, RainParticleMult *mult, float rotation,
+                                 float brightness, float localTime, unsigned char flags)
+{
+	auto emit = reinterpret_cast<AddRainParticle>(g_origRainHaze);
+	if (!g_cfg.rainFx || !mult || !pos) {
+		emit(fx, pos, velocity, age, mult, rotation, brightness, localTime, flags);
+		return;
+	}
+	// Same camera origin used by CWeather::AddRain when it places the haze.
+	const BYTE *matrix = *reinterpret_cast<const BYTE *const *>(0xB6F03C);
+	const auto *camera = reinterpret_cast<const WheelPosition *>(matrix ? matrix + 0x30 : (const BYTE *)0xB6F02C);
+	const float dx = pos->x - camera->x, dy = pos->y - camera->y;
+	const float distance2 = dx * dx + dy * dy;
+	if (distance2 <= 144.0f || mult->alpha <= 0.0f) return;
+	static RainParticleBudget budget;
+	if (!budget.Take(12.0f, 1.0f)) return;
+	float fade = (distance2 - 144.0f) / (400.0f - 144.0f);
+	if (fade > 1.0f) fade = 1.0f;
+	auto mist = *mult;
+	mist.alpha *= fade * .16f;
+	mist.size *= .55f;
+	emit(fx, pos, velocity, age, &mist, rotation, brightness, localTime, flags);
+}
+
+static void __fastcall hkRainSplash(void *fx, void *, WheelPosition *pos, WheelPosition *velocity,
+                                   float age, RainParticleMult *mult, float rotation,
+                                   float brightness, float localTime, unsigned char flags)
+{
+	auto emit = reinterpret_cast<AddRainParticle>(g_origRainSplash);
+	if (!g_cfg.rainFx || !mult) {
+		emit(fx, pos, velocity, age, mult, rotation, brightness, localTime, flags);
+		return;
+	}
+	static RainParticleBudget budget;
+	if (!budget.Take(160.0f, 10.0f)) return;
+	auto splash = *mult;
+	splash.alpha *= .65f;
+	splash.size *= .75f;
+	emit(fx, pos, velocity, age, &splash, rotation, brightness, localTime, flags);
+}
+
+static void __fastcall hkWheelSpray(void *fx, void *, void *vehicle, WheelPosition position,
+                                   unsigned char spinning, unsigned char inWater, float brightness)
+{
+	const int mode = g_cfg.wheelSpray;
+	if (mode == 0) {
+		static bool logged = false;
+		if (!logged) { logged = true; Log("Graphics: wheel spray suppressed"); }
+		return;
+	}
+	if (mode == 2 && inWater) {
+		struct VehicleSpray {
+			void *vehicle;
+			DWORD lastBurst;
+			unsigned count;
+		};
+		static VehicleSpray recent[256] = {};
+		auto &entry = recent[(reinterpret_cast<uintptr_t>(vehicle) >> 4) & 255u];
+		const DWORD now = GetTickCount();
+		if (entry.vehicle != vehicle || now - entry.lastBurst >= 33) {
+			entry = { vehicle, now, 0 };
+		}
+		if (entry.count >= 2) {
+			static bool logged = false;
+			if (!logged) { logged = true; Log("Graphics: water spray rate limit active"); }
+			return;
+		}
+		++entry.count;
+	}
+	using AddWheelSpray = void(__thiscall *)(void *, void *, WheelPosition, unsigned char, unsigned char, float);
+	((AddWheelSpray)g_origWheelSpray)(fx, vehicle, position, spinning, inWater, brightness);
 }
 
 static bool IsSystemD3D9(HMODULE mod, wchar_t *pathOut, DWORD cap)
@@ -299,7 +428,6 @@ static void TryHookD3D9(HMODULE mod)
 		g_d3d9Hooked = true;
 		Log("Hook: using GetProcAddress hook for Direct3DCreate9");
 	}
-	InstallD3D9DetourBridge(mod);
 }
 
 static HMODULE WINAPI hkLoadLibraryA(LPCSTR name)
@@ -350,6 +478,13 @@ static void HookGtaInputMarker()
 	// right after it returns guarantees we capture the complete 3D color + INTZ depth buffer BEFORE
 	// both SA-MP (chat/dialogs/nametags) and GTA SA (HUD/radar) draw any 2D UI.
 	tryHookCall(0x53EAD3, 0x53E170, (void *)hkRenderEffects, &g_origRenderEffects, "Graphics: 3D/2D boundary");
+	tryHookCall(0x6D2DA8, 0x49FB30, (void *)hkWheelSpray, &g_origWheelSpray, "Graphics: wheel spray in water");
+	tryHookCall(0x6D2FE7, 0x49FB30, (void *)hkWheelSpray, &g_origWheelSpray, "Graphics: wheel spray on roads");
+	tryHookCall(0x53439C, 0x749B20, (void *)hkEntityClumpRender, &g_origClumpRender, "Rain: player reflection");
+	// RenderWeaponCB submits the positioned atomic through this call in both GTA and SilentPatch.
+	tryHookCall(0x7336D7, 0x7491C0, (void *)hkWeaponAtomicRender, &g_origWeaponAtomicRender, "Rain: equipped weapon");
+	tryHookCall(0x72AF59, 0x4AA440, (void *)hkRainHaze, &g_origRainHaze, "Rain: camera haze");
+	tryHookCall(0x72AD55, 0x4AA440, (void *)hkRainSplash, &g_origRainSplash, "Rain: surface splashes");
 }
 
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)

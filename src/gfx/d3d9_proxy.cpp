@@ -4,6 +4,8 @@
 #include "async_screenshot.h"
 #include "blit_bc.h"
 #include "managed_resources.h"
+#include "rain_lighting.h"
+#include "player_reflection.h"
 #include "../core/frame_pacer.h"
 #include "../core/log.h"
 #include "../core/patch.h"
@@ -616,11 +618,16 @@ public:
 
 	static bool Want3dMaskTargets()
 	{
-		return g_cfg.depthCas && (g_cfg.aoQuality > 0 || g_cfg.aaQuality > 0 || g_cfg.ssrQuality > 0 ||
+		return WantRoadPuddles() || (g_cfg.depthCas && (g_cfg.aoQuality > 0 || g_cfg.aaQuality > 0 || g_cfg.ssrQuality > 0 ||
 		                          g_cfg.giStrength > 0.001f || g_cfg.rainFx ||
 		                          g_cfg.bloomStrength > 0.001f || g_cfg.fogStrength > 0.001f ||
 		                          g_cfg.tonemapMode > 0 || g_cfg.clarity > 0.001f ||
-		                          g_cfg.sharpness > 0.001f || g_cfg.lutName[0] != 0);
+		                          g_cfg.sharpness > 0.001f || g_cfg.lutName[0] != 0));
+	}
+
+	static bool WantRoadPuddles()
+	{
+		return g_cfg.rainFx && g_cfg.ssrQuality > 0;
 	}
 
 	static void ComputeScaledGameSize(UINT baseW, UINT baseH, UINT &outW, UINT &outH)
@@ -640,6 +647,12 @@ public:
 		if (h < 240u) h = 240u;
 		outW = w;
 		outH = h;
+	}
+
+	static bool IsSceneProjection(const D3DMATRIX &p)
+	{
+		return fabsf(p._34 - 1.0f) < 0.02f && fabsf(p._44) < 0.02f &&
+		       fabsf(p._11) > 0.30f && fabsf(p._22) > 0.30f && p._33 > 0.99f && p._33 < 1.15f;
 	}
 
 	void ReadGtaCameraParams(FrameCameraParams &out) const
@@ -676,6 +689,10 @@ public:
 			if (wet  >= 0.0f && wet  <= 2.0f) out.wetRoads   = (wet  > 1.0f) ? 1.0f : wet;
 			if (wfog >= 0.0f && wfog <= 2.0f) out.weatherFog = (wfog > 1.0f) ? 1.0f : wfog;
 			out.inInterior = (area != 0);
+			if (g_cfg.rainFx && !out.inInterior && (out.rain > 0.05f || out.wetRoads > 0.65f)) {
+				const auto cameraNoRain = reinterpret_cast<bool(__cdecl *)()>(0x72DDB0);
+				out.sheltered = cameraNoRain();
+			}
 
 			const BYTE *cc = (const BYTE *)0x00B7C4A0; // CTimeCycle::m_CurrentColours
 			uint16_t stR = *(const uint16_t *)(cc + 0x28);
@@ -727,41 +744,20 @@ public:
 		}
 	}
 
-	// Called at the exact GTA:SA 3D -> 2D boundary (0x0053EB12 before Render2dStuff).
-	// Captures 3D-only color (for 2D UI protection of XeGTAO/CAS/LUT) and resolves INTZ depth to shared R32F.
-	void OnBefore2dStuff()
+	bool CopySceneDepth(IDirect3DSurface9 *destination, UINT w, UINT h)
 	{
-		FlushUpBatch();
-		if (m_captured3dThisFrame || !m_real || !m_backBufferSurf) return;
-		const int slot = m_writeSlot;
-		const bool do3d   = (m_shared3dSurf[slot] != nullptr);
-		const bool doDepth = (m_intzDepthTex != nullptr && m_sharedDepthSurf[slot] != nullptr && m_depthCopyPS != nullptr);
-		if (!do3d && !doDepth) return;
-
-		m_captured3dThisFrame = true;
-		m_presenter.WaitForSlot(slot);
-
-		if (do3d) {
-			if (SUCCEEDED(m_real->StretchRect(m_backBufferSurf, nullptr, m_shared3dSurf[slot], nullptr, D3DTEXF_NONE)))
-				m_has3dMaskThisFrame = true;
-		}
-
-		if (doDepth) {
-			ReadGtaCameraParams(m_curCamParams);
-
+		bool copied = false;
+		if (m_intzDepthTex && destination && m_depthCopyPS && m_depthCopySB &&
+		    SUCCEEDED(m_depthCopySB->Capture())) {
 			IDirect3DSurface9 *prevRt0 = nullptr;
 			IDirect3DSurface9 *prevDs  = nullptr;
 			D3DVIEWPORT9 prevVp = {};
 			m_real->GetRenderTarget(0, &prevRt0);
 			m_real->GetDepthStencilSurface(&prevDs);
 			m_real->GetViewport(&prevVp);
-			if (m_depthCopySB) m_depthCopySB->Capture();
-
-			const UINT w = m_pp.BackBufferWidth;
-			const UINT h = m_pp.BackBufferHeight;
 			// Unbind INTZ as depth-stencil before binding it as SRV texture on stage 0.
 			m_real->SetDepthStencilSurface(nullptr);
-			if (SUCCEEDED(m_real->SetRenderTarget(0, m_sharedDepthSurf[slot]))) {
+			if (SUCCEEDED(m_real->SetRenderTarget(0, destination))) {
 				D3DVIEWPORT9 vp = { 0, 0, w, h, 0.0f, 1.0f };
 				m_real->SetViewport(&vp);
 				m_real->SetRenderState(D3DRS_ZENABLE, FALSE);
@@ -791,11 +787,11 @@ public:
 					{ fw - 0.5f,  fh - 0.5f,  0.0f, 1.0f, 1.0f, 1.0f },
 				};
 				if (SUCCEEDED(m_real->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, q, sizeof(QuadVert))))
-					m_hasDepthThisFrame = true;
+					copied = true;
 				m_real->SetTexture(0, nullptr);
 			}
 
-			if (m_depthCopySB) m_depthCopySB->Apply();
+			m_depthCopySB->Apply();
 			m_real->SetRenderTarget(0, prevRt0 ? prevRt0 : m_backBufferSurf);
 			m_real->SetDepthStencilSurface(prevDs ? prevDs : m_depthSurf);
 			m_real->SetViewport(&prevVp);
@@ -803,6 +799,78 @@ public:
 			SafeRelease(prevDs);
 			InvalidateStateCache();
 		}
+		return copied;
+	}
+
+	void *RenderPlayer(void *clump, RenderRwObject render)
+	{
+		if (m_actorCaptured || m_frontEndFrame || m_captured3dThisFrame || !m_rt0IsBackBuffer ||
+		    !m_playerMirror.handles[m_writeSlot] || !WantRoadPuddles() || !IsGtaSaUs10()) return render(clump);
+		const float rain = *(const float *)0xC81324, wet = *(const float *)0xC81308;
+		if ((rain <= .05f && wet <= .65f) || *(const int *)0xB72914 ||
+		    reinterpret_cast<bool(__cdecl *)()>(0x72DDB0)()) return render(clump);
+		const BYTE *ped = *reinterpret_cast<const BYTE *const *>(0xB6F5F0);
+		constexpr DWORD inVehicle = 1u << 8;
+		if (!ped || (*reinterpret_cast<const DWORD *>(ped + 0x46C) & inVehicle)) return render(clump);
+		const BYTE *matrix = *reinterpret_cast<const BYTE *const *>(ped + 0x14);
+		const float *pos = reinterpret_cast<const float *>(matrix ? matrix + 0x30 : ped + 4);
+		float ground[4] = {pos[0], pos[1], pos[2], 0};
+		if (!FindPavedGround(pos[0],pos[1],pos[2],ground[3])) return render(clump);
+		FlushUpBatch();
+		if (!m_playerMirror.Begin(m_real,ground)) return render(clump);
+		m_replayPlayerDraw = true;
+		void *result = render(clump);
+		m_replayPlayerDraw = false;
+		m_actorCaptured = m_playerMirror.End();
+		if (m_actorCaptured) {
+			memcpy(m_actorGround,ground,sizeof(ground));
+			static bool logged = false;
+			if (!logged) { logged = true; Log("Rain: reflected local player's animated clump"); }
+		}
+		return result;
+	}
+
+	void *RenderPlayerWeapon(void *atomic, RenderRwObject render)
+	{
+		if (!m_actorCaptured || m_replayPlayerDraw || m_captured3dThisFrame || !m_rt0IsBackBuffer)
+			return render(atomic);
+		FlushUpBatch();
+		if (!m_playerMirror.Resume(m_real)) return render(atomic);
+		m_replayPlayerDraw = true;
+		void *result = render(atomic);
+		m_replayPlayerDraw = false;
+		// A custom weapon material may be unsupported. Keep the completed body pass.
+		const bool weaponCaptured = m_playerMirror.End();
+		if (weaponCaptured) {
+			static bool logged = false;
+			if (!logged) { logged = true; Log("Rain: captured equipped weapon in player reflection"); }
+		}
+		return result;
+	}
+
+	// Capture the finished world before the game and SA-MP draw their interfaces.
+	void OnBefore2dStuff()
+	{
+		FlushUpBatch();
+		if (m_frontEndFrame || m_captured3dThisFrame || !m_real || !m_backBufferSurf) return;
+		const int slot = m_writeSlot;
+		const bool doDepth = m_intzDepthTex && m_sharedDepthSurf[slot] && m_depthCopyPS;
+		if (doDepth || (g_cfg.rainFx && !m_hasCameraParamsThisFrame)) {
+			ReadGtaCameraParams(m_curCamParams);
+			m_hasCameraParamsThisFrame = true;
+		}
+		const bool captureRain = WantRoadPuddles() && !m_curCamParams.inInterior && !m_curCamParams.sheltered &&
+		                         (m_curCamParams.rain > 0.05f || m_curCamParams.wetRoads > 0.65f);
+		const bool do3d = m_shared3dSurf[slot] && (g_cfg.depthCas || captureRain);
+		if (!do3d && !doDepth) return;
+
+		m_captured3dThisFrame = true;
+		m_presenter.WaitForSlot(slot);
+		if (m_actorCaptured) m_actorCaptured = captureRain && m_playerMirror.CopyToSlot(m_real, slot);
+		if (do3d && SUCCEEDED(m_real->StretchRect(m_backBufferSurf, nullptr, m_shared3dSurf[slot], nullptr, D3DTEXF_NONE)))
+			m_has3dMaskThisFrame = true;
+		if (doDepth)
+			m_hasDepthThisFrame = CopySceneDepth(m_sharedDepthSurf[slot], m_pp.BackBufferWidth, m_pp.BackBufferHeight);
 	}
 
 	void ApplyBorderless(bool force)
@@ -1459,7 +1527,7 @@ public:
 			ComputeScaledGameSize(wantW, wantH, wantW, wantH);
 			bool needRebuild = (wantW != m_pp.BackBufferWidth || wantH != m_pp.BackBufferHeight) ||
 			                   (wantDepth != (m_intzDepthTex != nullptr)) ||
-			                   (want3dMask && !m_shared3dTex[0]);
+				                   (want3dMask && !m_shared3dTex[0]);
 			if (needRebuild && wantW >= 320 && wantH >= 240) {
 				m_presenter.DrainAsync();
 				m_pp.BackBufferWidth = wantW;
@@ -1478,7 +1546,7 @@ public:
 		int slot = m_writeSlot;
 		if (m_sharedSurf[slot]) {
 			m_presenter.WaitForSlot(slot);
-			if (m_backBufferSurf)
+			if (m_backBufferSurf && m_backBufferSurf != m_sharedSurf[slot])
 				m_real->StretchRect(m_backBufferSurf, nullptr, m_sharedSurf[slot], nullptr, D3DTEXF_NONE);
 
 			if (m_evQuery[slot]) {
@@ -1495,12 +1563,37 @@ public:
 			else
 				m_real->PresentEx(nullptr, nullptr, nullptr, nullptr, 0);
 		}
+		if (m_directFallbackSurf) {
+			const int nextSlot = slot ^ 1;
+			if (g_cfg.asyncPresent) {
+				m_presenter.WaitForSlot(nextSlot);
+				if (FAILED(SwitchBackBufferSurface(m_sharedSurf[nextSlot])) && !DisableDirectRendering())
+					return D3DERR_DEVICELOST;
+			} else if (!DisableDirectRendering()) {
+				return D3DERR_DEVICELOST;
+			}
+		}
 
 		m_frontSlot = slot;
 		uint64_t fid = m_curFrameId;
 		int64_t inQpc = m_curInputQpc;
+		if (!m_hasCameraParamsThisFrame) {
+			m_curCamParams = {};
+			if (g_cfg.rainFx)
+				ReadGtaCameraParams(m_curCamParams);
+		}
+		if (m_hasDepthThisFrame && m_has3dMaskThisFrame && WantRoadPuddles() && IsGtaSaUs10() &&
+		    m_curCamParams.hasViewProj && !m_curCamParams.inInterior && !m_curCamParams.sheltered &&
+		    (m_curCamParams.rain > 0.05f || m_curCamParams.wetRoads > 0.65f)) {
+			RoadSurfaceGrid &grid = m_presenter.RoadGridForSlot(slot);
+			m_curCamParams.hasRoadGrid = m_roadSurfaceCache.Update(m_curCamParams.viewMat, grid);
+			if (m_actorCaptured) {
+				memcpy(m_curCamParams.actorCrop, m_playerMirror.crop, sizeof(m_curCamParams.actorCrop));
+				memcpy(m_curCamParams.actorGround, m_actorGround, sizeof(m_curCamParams.actorGround));
+			}
+		}
 		m_presenter.SubmitFrame(slot, fid, g_cfg.asyncPresent, m_isMinimized, inQpc,
-		                        m_has3dMaskThisFrame, m_hasDepthThisFrame, &m_curCamParams);
+		                        m_has3dMaskThisFrame, m_hasDepthThisFrame, &m_curCamParams, m_frontEndFrame);
 		m_writeSlot ^= 1;
 
 		// Upload up to 4 background-decoded mipmapped textures during async D3D11 overlap (0ms frame-time hitch!)
@@ -1521,12 +1614,16 @@ public:
 
 		m_curFrameId = m_presenter.Reflex().NextFrameId();
 		SampTick();
+		if (IsGtaSaUs10()) UpdateRainLighting(g_cfg.rainLighting);
 		m_renderStartedThisFrame = false;
 		m_inputSampledThisFrame = false;
 		m_captured3dThisFrame = false;
+		m_actorCaptured = false;
 		m_has3dMaskThisFrame = false;
 		m_hasDepthThisFrame = false;
+		m_hasCameraParamsThisFrame = false;
 		m_hasSceneMats = false;
+		m_checkedDrawTransforms = false;
 		m_curInputQpc = 0;
 		return S_OK;
 	}
@@ -1695,6 +1792,37 @@ public:
 		*ppBackBuffer = m_backBufferSurf;
 		m_backBufferSurf->AddRef();
 		return S_OK;
+	}
+
+	HRESULT SwitchBackBufferSurface(IDirect3DSurface9 *next)
+	{
+		if (!next || !m_backBufferSurf) return D3DERR_INVALIDCALL;
+		IDirect3DSurface9 *bound = nullptr;
+		HRESULT hr = m_real->GetRenderTarget(0, &bound);
+		if (FAILED(hr)) return hr;
+		const bool isBound = bound == m_backBufferSurf;
+		SafeRelease(bound);
+		if (isBound) {
+			D3DVIEWPORT9 viewport = {};
+			hr = m_real->GetViewport(&viewport);
+			if (FAILED(hr)) return hr;
+			hr = m_real->SetRenderTarget(0, next);
+			if (FAILED(hr)) return hr;
+			m_real->SetViewport(&viewport);
+		}
+		next->AddRef();
+		SafeRelease(m_backBufferSurf);
+		m_backBufferSurf = next;
+	m_dirtySinceClear = true;
+		return S_OK;
+	}
+
+	bool DisableDirectRendering()
+	{
+		if (FAILED(SwitchBackBufferSurface(m_directFallbackSurf))) return false;
+		SafeRelease(m_directFallbackSurf);
+		Log("Bridge: returned to copied backbuffer");
+		return true;
 	}
 
 	HRESULT GetFrontBufferDataInternal(IDirect3DSurface9 *pDestSurface)
@@ -1929,12 +2057,14 @@ public:
 	}
 	HRESULT STDMETHODCALLTYPE CreateVertexBuffer(UINT Length, DWORD Usage, DWORD FVF, D3DPOOL Pool, IDirect3DVertexBuffer9 **ppVertexBuffer, HANDLE *pSharedHandle) override
 	{
+		if (Pool == D3DPOOL_SYSTEMMEM && !(Usage & D3DUSAGE_WRITEONLY)) m_hasCpuMeshVertices = true;
 		memset(m_streamValid, 0, sizeof(m_streamValid));
 		if (Pool == D3DPOOL_MANAGED) Pool = D3DPOOL_DEFAULT;
 		return m_real->CreateVertexBuffer(Length, Usage, FVF, Pool, ppVertexBuffer, pSharedHandle);
 	}
 	HRESULT STDMETHODCALLTYPE CreateIndexBuffer(UINT Length, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DIndexBuffer9 **ppIndexBuffer, HANDLE *pSharedHandle) override
 	{
+		if (Pool == D3DPOOL_SYSTEMMEM && !(Usage & D3DUSAGE_WRITEONLY)) m_hasCpuMeshIndices = true;
 		m_ibValid = false;
 		if (Pool == D3DPOOL_MANAGED) Pool = D3DPOOL_DEFAULT;
 		return m_real->CreateIndexBuffer(Length, Usage, Format, Pool, ppIndexBuffer, pSharedHandle);
@@ -1969,11 +2099,13 @@ public:
 
 	HRESULT STDMETHODCALLTYPE UpdateSurface(IDirect3DSurface9 *pSourceSurface, CONST RECT *pSourceRect, IDirect3DSurface9 *pDestinationSurface, CONST POINT *pDestPoint) override
 	{
+		FlushUpBatch();
 		return m_real->UpdateSurface(ResolveSurfaceForSys(pSourceSurface), pSourceRect,
 		                             ResolveSurfaceForGpu(pDestinationSurface), pDestPoint);
 	}
 	HRESULT STDMETHODCALLTYPE UpdateTexture(IDirect3DBaseTexture9 *pSourceTexture, IDirect3DBaseTexture9 *pDestinationTexture) override
 	{
+		FlushUpBatch();
 		return m_real->UpdateTexture(UnwrapBaseTextureForSys(pSourceTexture), UnwrapBaseTextureForGpu(pDestinationTexture));
 	}
 	HRESULT STDMETHODCALLTYPE GetRenderTargetData(IDirect3DSurface9 *pRenderTarget, IDirect3DSurface9 *pDestSurface) override
@@ -2065,6 +2197,8 @@ public:
 	{
 		if (!m_renderStartedThisFrame) {
 			m_renderStartedThisFrame = true;
+			// FrontEndMenuManager.m_bMenuActive, sampled on the game thread.
+			m_frontEndFrame = IsGtaSaUs10() && *reinterpret_cast<const uint8_t *>(0xBA67A4) != 0;
 			if (!m_inputSampledThisFrame)
 				MarkInputSampled();
 			m_presenter.Reflex().MarkFrame(m_curFrameId, RM_SIMULATION_END);
@@ -2129,9 +2263,7 @@ public:
 					}
 				}
 			} else if (State == D3DTS_PROJECTION) {
-				bool isPersp = (fabsf(pMatrix->_34 - 1.0f) < 0.02f && fabsf(pMatrix->_44) < 0.02f &&
-				                fabsf(pMatrix->_11) > 0.30f && fabsf(pMatrix->_22) > 0.30f &&
-				                pMatrix->_33 > 0.99f && pMatrix->_33 < 1.15f);
+				bool isPersp = IsSceneProjection(*pMatrix);
 				if (m_rt0IsBackBuffer && !m_captured3dThisFrame) {
 					m_sceneProjActive = isPersp;
 					if (isPersp) {
@@ -2152,7 +2284,8 @@ public:
 			if (slot >= 0) {
 				if (m_xformValid[slot] && Equal64SSE2(&m_xformVal[slot], pMatrix))
 					return S_OK;
-				FlushUpBatch();
+				if (State != D3DTS_WORLD || !m_batchLocalXYZ || !TranslationOnly(*pMatrix))
+					FlushUpBatch();
 				HRESULT hr = m_real->SetTransform(State, pMatrix);
 				if (SUCCEEDED(hr)) { m_xformValid[slot] = 1; m_xformVal[slot] = *pMatrix; }
 				return hr;
@@ -2428,7 +2561,7 @@ public:
 	{
 		const UINT t = (UINT)Type;
 		const int af = g_cfg.anisotropy;
-		if (af >= 2 && Sampler < 8 && !m_inStateBlock) {
+		if (af >= 2 && Sampler < 8 && !m_inStateBlock && !m_frontEndFrame) {
 			if (Type == D3DSAMP_MINFILTER && Value == D3DTEXF_LINEAR) {
 				Value = D3DTEXF_ANISOTROPIC;
 				const DWORD wantAf = (DWORD)af;
@@ -2506,31 +2639,56 @@ public:
 		FlushUpBatch();
 		m_dirtySinceClear = true;
 		FlushBoundManagedTextures();
+		if (m_replayPlayerDraw && m_playerMirror.Bind(m_real)) {
+			HRESULT replay = m_real->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
+			m_playerMirror.Restore(m_real, replay);
+		}
 		return m_real->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
 	}
 	HRESULT STDMETHODCALLTYPE DrawIndexedPrimitive(D3DPRIMITIVETYPE Type, INT BaseVertexIndex, UINT MinVertexIndex, UINT NumVertices, UINT startIndex, UINT primCount) override
 	{
 		if (g_cfg.stateCache && primCount == 0) return S_OK;
-		FlushUpBatch();
+		// A stationary camera may keep the device transforms across frames without a SetTransform call.
+		if (!m_hasSceneMats && !m_checkedDrawTransforms && !m_captured3dThisFrame &&
+		    m_rt0IsBackBuffer && WantRoadPuddles()) {
+			m_checkedDrawTransforms = true;
+			D3DMATRIX view, projection;
+			if (SUCCEEDED(m_real->GetTransform(D3DTS_PROJECTION, &projection)) && IsSceneProjection(projection) &&
+			    SUCCEEDED(m_real->GetTransform(D3DTS_VIEW, &view)) &&
+			    fabsf(view._41) + fabsf(view._42) + fabsf(view._43) > 0.25f) {
+				m_sceneViewMat = view;
+				m_sceneProjMat = projection;
+				m_hasSceneMats = true;
+			}
+		}
 		m_dirtySinceClear = true;
+		if (!m_replayPlayerDraw && m_hasCpuMeshVertices && m_hasCpuMeshIndices && !(m_boundManagedMask && HasDirtyManagedResources()) &&
+		    TryBatchBufferedMesh(Type, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, primCount))
+			return S_OK;
+		FlushUpBatch();
 		FlushBoundManagedTextures();
+		if (m_replayPlayerDraw && m_playerMirror.Bind(m_real)) {
+			HRESULT replay = m_real->DrawIndexedPrimitive(Type, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, primCount);
+			m_playerMirror.Restore(m_real, replay);
+		}
 		return m_real->DrawIndexedPrimitive(Type, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, primCount);
 	}
 	HRESULT STDMETHODCALLTYPE DrawPrimitiveUP(D3DPRIMITIVETYPE PrimitiveType, UINT PrimitiveCount, CONST void *pVertexStreamZeroData, UINT VertexStreamZeroStride) override
 	{
 		if (g_cfg.stateCache && PrimitiveCount == 0) return S_OK;
+		if (m_batchBuffered) FlushUpBatch();
 		m_dirtySinceClear = true;
-		if (HasDirtyManagedResources()) {
+		if (m_boundManagedMask && HasDirtyManagedResources()) {
 			FlushUpBatch();
 			FlushBoundManagedTextures();
 		}
 		// State-cache-aware TRIANGLELIST coalescing: merges consecutive identical-state UP draws
 		// (SA-MP chat glyphs, nametags, 3D texts, ImGui quads) into a single GPU draw call!
 		// Uses raw fixed-capacity staging buffer (0 vector zero-fill, fits inside L1/driver 64KB UP fast-path).
-		if (CacheActive() && PrimitiveType == D3DPT_TRIANGLELIST && pVertexStreamZeroData && VertexStreamZeroStride > 0 && PrimitiveCount <= 512u) {
+		if (!m_replayPlayerDraw && CacheActive() && PrimitiveType == D3DPT_TRIANGLELIST && pVertexStreamZeroData && VertexStreamZeroStride > 0 && PrimitiveCount <= 512u) {
 			const UINT vCount = PrimitiveCount * 3u;
-			const UINT vBytes = vCount * VertexStreamZeroStride;
-			if (vBytes <= kUpBatchMaxBytes) {
+			if (vCount && VertexStreamZeroStride <= kUpBatchMaxBytes / vCount) {
+				const UINT vBytes = vCount * VertexStreamZeroStride;
 				if (m_batchPrimCount > 0 && (m_batchIndexed || m_batchStride != VertexStreamZeroStride || m_batchVertBytes + vBytes > kUpBatchMaxBytes))
 					FlushUpBatch();
 				if (m_batchPrimCount == 0) {
@@ -2538,7 +2696,7 @@ public:
 					m_batchStride    = VertexStreamZeroStride;
 					m_batchVertBytes = 0;
 				}
-				memcpy(m_batchVertBuf + m_batchVertBytes, pVertexStreamZeroData, vBytes);
+				AppendUpVertices(pVertexStreamZeroData, vCount, VertexStreamZeroStride);
 				m_batchVertBytes += vBytes;
 				m_batchPrimCount += PrimitiveCount;
 				// D3D9 spec: DrawPrimitiveUP unbinds Stream 0 (so any subsequent SetStreamSource(0) flushes first!)
@@ -2548,21 +2706,25 @@ public:
 		}
 		FlushUpBatch();
 		m_streamValid[0] = 0;
+		if (m_replayPlayerDraw && m_playerMirror.Bind(m_real)) {
+			m_playerMirror.Restore(m_real, m_real->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride));
+		}
 		return m_real->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
 	}
 	HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveUP(D3DPRIMITIVETYPE PrimitiveType, UINT MinVertexIndex, UINT NumVertices, UINT PrimitiveCount, CONST void *pIndexData, D3DFORMAT IndexDataFormat, CONST void *pVertexStreamZeroData, UINT VertexStreamZeroStride) override
 	{
 		if (g_cfg.stateCache && PrimitiveCount == 0) return S_OK;
+		if (m_batchBuffered) FlushUpBatch();
 		m_dirtySinceClear = true;
-		if (HasDirtyManagedResources()) {
+		if (m_boundManagedMask && HasDirtyManagedResources()) {
 			FlushUpBatch();
 			FlushBoundManagedTextures();
 		}
-		if (CacheActive() && PrimitiveType == D3DPT_TRIANGLELIST && IndexDataFormat == D3DFMT_INDEX16 &&
+		if (!m_replayPlayerDraw && CacheActive() && PrimitiveType == D3DPT_TRIANGLELIST && IndexDataFormat == D3DFMT_INDEX16 &&
 		    pVertexStreamZeroData && pIndexData && VertexStreamZeroStride > 0 && MinVertexIndex == 0 && NumVertices > 0 && PrimitiveCount <= 512u) {
 			const UINT idxCount = PrimitiveCount * 3u;
-			const UINT vBytes = NumVertices * VertexStreamZeroStride;
-			if (vBytes <= kUpBatchMaxBytes && idxCount <= kUpBatchMaxIndices) {
+			if (VertexStreamZeroStride <= kUpBatchMaxBytes / NumVertices && idxCount <= kUpBatchMaxIndices) {
+				const UINT vBytes = NumVertices * VertexStreamZeroStride;
 				if (m_batchPrimCount > 0 && (!m_batchIndexed || m_batchStride != VertexStreamZeroStride ||
 				    m_batchVertBytes + vBytes > kUpBatchMaxBytes || m_batchVertCount + NumVertices > 65535u ||
 				    m_batchIdxCount + idxCount > kUpBatchMaxIndices))
@@ -2575,7 +2737,7 @@ public:
 					m_batchIdxCount  = 0;
 				}
 				const uint16_t baseV = (uint16_t)m_batchVertCount;
-				memcpy(m_batchVertBuf + m_batchVertBytes, pVertexStreamZeroData, vBytes);
+				AppendUpVertices(pVertexStreamZeroData, NumVertices, VertexStreamZeroStride);
 				m_batchVertBytes += vBytes;
 				const auto *srcIdx = (const uint16_t *)pIndexData;
 				uint16_t *dstIdx = m_batchIdxBuf + m_batchIdxCount;
@@ -2597,6 +2759,9 @@ public:
 		FlushUpBatch();
 		m_streamValid[0] = 0;
 		m_ibValid = false;
+		if (m_replayPlayerDraw && m_playerMirror.Bind(m_real)) {
+			m_playerMirror.Restore(m_real, m_real->DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride));
+		}
 		return m_real->DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride);
 	}
 	HRESULT STDMETHODCALLTYPE ProcessVertices(UINT SrcStartIndex, UINT DestIndex, UINT VertexCount, IDirect3DVertexBuffer9 *pDestBuffer, IDirect3DVertexDeclaration9 *pVertexDecl, DWORD Flags) override { FlushUpBatch(); return m_real->ProcessVertices(SrcStartIndex, DestIndex, VertexCount, pDestBuffer, pVertexDecl, Flags); }
@@ -2914,7 +3079,13 @@ public:
 	HRESULT STDMETHODCALLTYPE DrawRectPatch(UINT Handle, CONST float *pNumSegs, CONST D3DRECTPATCH_INFO *pRectPatchInfo) override { FlushUpBatch(); return m_real->DrawRectPatch(Handle, pNumSegs, pRectPatchInfo); }
 	HRESULT STDMETHODCALLTYPE DrawTriPatch(UINT Handle, CONST float *pNumSegs, CONST D3DTRIPATCH_INFO *pTriPatchInfo) override { FlushUpBatch(); return m_real->DrawTriPatch(Handle, pNumSegs, pTriPatchInfo); }
 	HRESULT STDMETHODCALLTYPE DeletePatch(UINT Handle) override { return m_real->DeletePatch(Handle); }
-	HRESULT STDMETHODCALLTYPE CreateQuery(D3DQUERYTYPE Type, IDirect3DQuery9 **ppQuery) override { return m_real->CreateQuery(Type, ppQuery); }
+	HRESULT STDMETHODCALLTYPE CreateQuery(D3DQUERYTYPE Type, IDirect3DQuery9 **ppQuery) override
+	{
+		if (ppQuery) FlushUpBatch();
+		HRESULT hr = m_real->CreateQuery(Type, ppQuery);
+		if (ppQuery && SUCCEEDED(hr)) m_appUsesQueries = true;
+		return hr;
+	}
 
 	inline void FlushUpBatch()
 	{
@@ -2924,10 +3095,113 @@ public:
 
 private:
 
+	static bool TranslationOnly(const D3DMATRIX &m)
+	{
+		return m._11 == 1 && m._22 == 1 && m._33 == 1 && m._44 == 1 &&
+		       m._12 == 0 && m._13 == 0 && m._14 == 0 && m._21 == 0 && m._23 == 0 &&
+		       m._24 == 0 && m._31 == 0 && m._32 == 0 && m._34 == 0;
+	}
+
+	bool CanBatchPlacements(UINT stride) const
+	{
+		const int world = TransformSlot(D3DTS_WORLD);
+		return !m_appUsesQueries && !m_frontEndFrame && !m_captured3dThisFrame && m_rt0IsBackBuffer &&
+		       m_fvfValid && (m_fvfVal & D3DFVF_POSITION_MASK) == D3DFVF_XYZ && stride >= 3 * sizeof(float) &&
+		       m_vsValid && !m_vs && m_rsValid[D3DRS_ALPHABLENDENABLE] && !m_rsVal[D3DRS_ALPHABLENDENABLE] &&
+		       m_rsValid[D3DRS_VERTEXBLEND] && m_rsVal[D3DRS_VERTEXBLEND] == D3DVBF_DISABLE &&
+		       m_xformValid[world] && TranslationOnly(m_xformVal[world]);
+	}
+
+	bool TryBatchBufferedMesh(D3DPRIMITIVETYPE type, INT base, UINT minVertex, UINT vertices, UINT start, UINT prims)
+	{
+		const bool strip = type == D3DPT_TRIANGLESTRIP;
+		if (!CacheActive() || (!strip && type != D3DPT_TRIANGLELIST) || !prims || prims > 512 || !vertices ||
+		    !m_streamValid[0] || !m_streamVb[0] || !m_ibValid || !m_ib ||
+		    !CanBatchPlacements(m_streamStride[0])) return false;
+		if (strip && (!m_rsValid[D3DRS_SHADEMODE] || m_rsVal[D3DRS_SHADEMODE] != D3DSHADE_GOURAUD)) return false;
+		const UINT stride = m_streamStride[0];
+		if (vertices > kUpBatchMaxBytes / stride) return false;
+		if (m_streamFreqValid[0] && m_streamFreqVal[0] != 1) return false;
+		UINT frequency = 0;
+		if (!m_streamFreqValid[0] && (FAILED(m_real->GetStreamSourceFreq(0, &frequency)) || frequency != 1)) return false;
+		D3DVERTEXBUFFER_DESC vb{};
+		D3DINDEXBUFFER_DESC ib{};
+		if (FAILED(m_streamVb[0]->GetDesc(&vb)) || FAILED(m_ib->GetDesc(&ib)) ||
+		    vb.Pool != D3DPOOL_SYSTEMMEM || ib.Pool != D3DPOOL_SYSTEMMEM || ib.Format != D3DFMT_INDEX16 ||
+		    ((vb.Usage | ib.Usage) & D3DUSAGE_WRITEONLY)) return false;
+		const int64_t first = int64_t(base) + minVertex;
+		if (first < 0) return false;
+		const uint64_t byteStart = m_streamOff[0] + uint64_t(first) * stride;
+		const UINT bytes = vertices * stride, indices = prims * 3;
+		const UINT sourceCount = strip ? prims + 2 : indices;
+		if (byteStart + bytes > vb.Size || (uint64_t(start) + sourceCount) * 2 > ib.Size) return false;
+		if (m_batchPrimCount && (!m_batchBuffered || m_batchVertBytes + bytes > kUpBatchMaxBytes ||
+		    m_batchIdxCount + indices > kUpBatchMaxIndices)) FlushUpBatch();
+		void *v = nullptr, *idx = nullptr;
+		if (FAILED(m_streamVb[0]->Lock(UINT(byteStart), bytes, &v, D3DLOCK_READONLY))) return false;
+		if (FAILED(m_ib->Lock(start * 2, sourceCount * 2, &idx, D3DLOCK_READONLY))) {
+			m_streamVb[0]->Unlock();
+			return false;
+		}
+		const auto *source = static_cast<const uint16_t *>(idx);
+		bool valid = true;
+		for (UINT i = 0; i < indices; ++i) {
+			UINT read = i;
+			if (strip) {
+				const UINT face = i / 3, corner = i % 3;
+				read = face + ((face & 1) && corner < 2 ? 1 - corner : corner);
+			}
+			const UINT relative = UINT(source[read]) - minVertex;
+			if (relative >= vertices) { valid = false; break; }
+			m_batchIdxBuf[m_batchIdxCount + i] = uint16_t(m_batchVertCount + relative);
+		}
+		if (valid) {
+			AppendUpVertices(v, vertices, stride);
+			m_batchIndexed = m_batchBuffered = true;
+			m_batchStride = stride;
+			m_batchVertBytes += bytes;
+			m_batchVertCount += vertices;
+			m_batchIdxCount += indices;
+			m_batchPrimCount += prims;
+		}
+		m_ib->Unlock();
+		m_streamVb[0]->Unlock();
+		return valid;
+	}
+
+	void AppendUpVertices(const void *vertices, UINT count, UINT stride)
+	{
+		uint8_t *dst = m_batchVertBuf + m_batchVertBytes;
+		memcpy(dst, vertices, size_t(count) * stride);
+		const int world = TransformSlot(D3DTS_WORLD);
+		const D3DMATRIX &matrix = m_xformVal[world];
+		if (!m_batchPrimCount) {
+			m_batchLocalXYZ = CanBatchPlacements(stride);
+			if (m_batchLocalXYZ) m_batchWorld = matrix;
+		}
+		if (!m_batchLocalXYZ) return;
+		const float dx = matrix._41 - m_batchWorld._41, dy = matrix._42 - m_batchWorld._42, dz = matrix._43 - m_batchWorld._43;
+		if (!dx && !dy && !dz) return;
+		for (UINT i = 0; i < count; ++i, dst += stride) {
+			float xyz[3];
+			memcpy(xyz, dst, sizeof(xyz));
+			xyz[0] += dx; xyz[1] += dy; xyz[2] += dz;
+			memcpy(dst, xyz, sizeof(xyz));
+		}
+	}
+
 	void FlushUpBatchSlow()
 	{
 		const UINT prims = m_batchPrimCount;
 		if (prims == 0 || !m_real) return;
+		const auto &world = m_xformVal[TransformSlot(D3DTS_WORLD)];
+		const bool restore = m_batchLocalXYZ && !Equal64SSE2(&m_batchWorld, &world);
+		if (restore) m_real->SetTransform(D3DTS_WORLD, &m_batchWorld);
+		m_batchLocalXYZ = false;
+		if (m_batchBuffered) {
+			m_streamVb[0]->AddRef();
+			m_ib->AddRef();
+		}
 		m_batchPrimCount = 0;
 		m_batchVertBytes = 0;
 		if (m_batchIndexed) {
@@ -2943,15 +3217,25 @@ private:
 			m_streamValid[0] = 0;
 			m_real->DrawPrimitiveUP(D3DPT_TRIANGLELIST, prims, m_batchVertBuf, m_batchStride);
 		}
+		if (restore) m_real->SetTransform(D3DTS_WORLD, &world);
+		if (m_batchBuffered) {
+			m_streamValid[0] = SUCCEEDED(m_real->SetStreamSource(0, m_streamVb[0], m_streamOff[0], m_streamStride[0]));
+			m_ibValid = SUCCEEDED(m_real->SetIndices(m_ib));
+			m_streamVb[0]->Release();
+			m_ib->Release();
+			m_batchBuffered = false;
+		}
 	}
 
 	void ReleaseGameTargets()
 	{
 		FlushUpBatch();
 		m_presenter.UnbindSharedTextures();
+		m_playerMirror.Release();
+		m_actorCaptured = false;
 		ReleaseManagedMipScratch();
 		if (m_real) {
-			if (!m_realUsesSwapchain && m_backBufferSurf) {
+			if ((!m_realUsesSwapchain || m_directFallbackSurf) && m_backBufferSurf) {
 				IDirect3DSurface9 *bb = nullptr;
 				if (SUCCEEDED(m_real->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) && bb) {
 					m_real->SetRenderTarget(0, bb);
@@ -2967,7 +3251,10 @@ private:
 		SafeRelease(m_depthSurf);
 		SafeRelease(m_intzDepthTex);
 		SafeRelease(m_backBufferSurf);
+		SafeRelease(m_directFallbackSurf);
 		m_rt0IsBackBuffer = true;
+		m_has3dMaskThisFrame = false;
+		m_hasDepthThisFrame = false;
 		for (int i = 0; i < D3D11Presenter::kNumSlots; ++i) {
 			SafeRelease(m_sharedSurf[i]);
 			SafeRelease(m_sharedTex[i]);
@@ -3104,6 +3391,9 @@ private:
 			}
 		}
 
+		const bool wantDirect = g_cfg.directRenderTargets && g_cfg.asyncPresent && m_presenter.CanShareRenderTargets() &&
+		                        m_pp.MultiSampleType == D3DMULTISAMPLE_NONE && m_pp.SwapEffect == D3DSWAPEFFECT_DISCARD;
+		if (wantDirect) useRealSwapchainNow = false;
 		if (useRealSwapchainNow) {
 			HRESULT hr1 = m_real->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &m_backBufferSurf);
 			HRESULT hr2 = intzReady ? S_OK : m_real->GetDepthStencilSurface(&m_depthSurf);
@@ -3140,7 +3430,14 @@ private:
 			m_real->SetRenderTarget(0, m_sharedSurf[i]);
 			m_real->Clear(0, nullptr, D3DCLEAR_TARGET, 0xFF000000, 1.0f, 0);
 		}
-		m_real->SetRenderTarget(0, m_backBufferSurf);
+		if (wantDirect && SUCCEEDED(m_real->SetRenderTarget(0, m_sharedSurf[m_writeSlot]))) {
+			m_directFallbackSurf = m_backBufferSurf;
+			m_backBufferSurf = m_sharedSurf[m_writeSlot];
+			m_backBufferSurf->AddRef();
+			Log("Bridge: rendering directly into shared color slots");
+		} else {
+			m_real->SetRenderTarget(0, m_backBufferSurf);
+		}
 		m_real->SetDepthStencilSurface(m_depthSurf);
 		m_rt0IsBackBuffer = true;
 		D3DVIEWPORT9 vp = { 0, 0, w, h, 0.0f, 1.0f };
@@ -3148,10 +3445,11 @@ private:
 		m_real->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xFF000000, 1.0f, 0);
 		InvalidateStateCache();
 
+		if (intzReady && want3dMask) m_playerMirror.Create(m_real);
 		return m_presenter.BindSharedTextures(
 			m_sharedHandle,
 			m_shared3dHandle[0] ? m_shared3dHandle : nullptr,
-			m_sharedDepthHandle[0] ? m_sharedDepthHandle : nullptr,
+			m_sharedDepthHandle[0] ? m_sharedDepthHandle : nullptr, m_playerMirror.handles,
 			w, h);
 	}
 
@@ -3193,8 +3491,15 @@ private:
 	int                    m_frontSlot = 0;
 	uint64_t               m_curFrameId = 0;
 	int64_t                m_curInputQpc = 0;
+	PlayerReflection       m_playerMirror;
+	float                  m_actorGround[4] = {};
+	bool                   m_actorCaptured = false;
+	bool m_replayPlayerDraw = false;
 	FrameCameraParams      m_curCamParams = {};
+	RoadSurfaceCache       m_roadSurfaceCache;
+	bool                   m_hasCameraParamsThisFrame = false;
 	bool                   m_rt0IsBackBuffer = true;
+	bool                   m_frontEndFrame = false;
 	bool                   m_captured3dThisFrame = false;
 	bool                   m_has3dMaskThisFrame = false;
 	bool                   m_hasDepthThisFrame = false;
@@ -3202,6 +3507,7 @@ private:
 	UINT                   m_logicalBaseW = 0;
 	UINT                   m_logicalBaseH = 0;
 	IDirect3DSurface9     *m_backBufferSurf = nullptr;
+	IDirect3DSurface9     *m_directFallbackSurf = nullptr;
 	IDirect3DSurface9     *m_depthSurf = nullptr;
 	IDirect3DSurface9     *m_sysReadbackSurf = nullptr;
 	UINT                   m_sysReadbackW = 0;
@@ -3291,6 +3597,12 @@ private:
 	UINT                   m_batchVertCount = 0;
 	UINT                   m_batchStride = 0;
 	bool                   m_batchIndexed = false;
+	bool                   m_batchLocalXYZ = false;
+	bool                   m_batchBuffered = false;
+	bool                   m_appUsesQueries = false;
+	bool                   m_hasCpuMeshVertices = false;
+	bool                   m_hasCpuMeshIndices = false;
+	D3DMATRIX              m_batchWorld = {};
 	HANDLE                 m_mmcssGame = nullptr;
 	BYTE                   m_xformValid[18] = {};
 	D3DMATRIX              m_xformVal[18] = {};
@@ -3328,6 +3640,7 @@ private:
 	bool                   m_hasLastView = false;
 	bool                   m_sceneProjActive = false;
 	bool                   m_hasSceneMats = false;
+	bool                   m_checkedDrawTransforms = false;
 };
 
 ProxyStateBlock9::ProxyStateBlock9(ProxyDirect3DDevice9 *dev, IDirect3DStateBlock9 *real)
@@ -3583,6 +3896,7 @@ public:
 			DestroyWindow(dummyHwnd);
 			return FallbackNativeCreateDevice(Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPP, ppReturnedDeviceInterface);
 		}
+		InstallD3D9DetourBridgeFromDevice(realDevEx);
 
 		D3DPRESENT_PARAMETERS effPP = *pPP;
 		if (usesRealSwapchain) {
@@ -3649,61 +3963,34 @@ static __declspec(noinline) HRESULT STDMETHODCALLTYPE md_bottomEndScene(IDirect3
 }
 #pragma optimize("", on)
 
-static void **FindD3D9BaseVtable(HMODULE d3d9Mod, uintptr_t &imgStartOut, uintptr_t &imgEndOut)
+static bool GetModuleImageRange(HMODULE mod, uintptr_t &imgStartOut, uintptr_t &imgEndOut)
 {
-	if (!d3d9Mod) return nullptr;
-	BYTE *base = (BYTE *)d3d9Mod;
-	auto *dos = (IMAGE_DOS_HEADER *)base;
-	if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
-	auto *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
-	if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
-
-	DWORD size = nt->OptionalHeader.SizeOfImage;
-	imgStartOut = (uintptr_t)base;
-	imgEndOut   = (uintptr_t)(base + size);
-
-	// Standard d3d9.dll CD3DBase constructor pattern: mov [esi], offset vtable; mov [esi+..], eax; mov [esi+..], eax
-	auto *sec = IMAGE_FIRST_SECTION(nt);
-	for (WORD s = 0; s < nt->FileHeader.NumberOfSections; ++s, ++sec) {
-		if (!(sec->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
-		DWORD va = sec->VirtualAddress;
-		DWORD len = sec->Misc.VirtualSize ? sec->Misc.VirtualSize : sec->SizeOfRawData;
-		if (va + len > size || len < 14) continue;
-		const BYTE *p = base + va;
-		for (DWORD i = 0; i + 14 <= len; ++i) {
-			if (p[i] == 0xC7 && p[i + 1] == 0x06 &&
-			    p[i + 6] == 0x89 && p[i + 7] == 0x86 &&
-			    p[i + 12] == 0x89 && p[i + 13] == 0x86) {
-				uintptr_t vtAddr = 0;
-				memcpy(&vtAddr, p + i + 2, 4);
-				if (vtAddr >= imgStartOut && vtAddr + 119 * sizeof(void *) <= imgEndOut)
-					return (void **)vtAddr;
-			}
-		}
-	}
-	return nullptr;
-}
-
-static void **FindD3D9BaseVtableSafe(HMODULE d3d9Mod, uintptr_t &imgStartOut, uintptr_t &imgEndOut)
-{
+	if (!mod) return false;
 	__try {
-		return FindD3D9BaseVtable(d3d9Mod, imgStartOut, imgEndOut);
+		BYTE *base = (BYTE *)mod;
+		auto *dos = (IMAGE_DOS_HEADER *)base;
+		if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+		auto *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+		if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+		imgStartOut = (uintptr_t)base;
+		imgEndOut   = (uintptr_t)(base + nt->OptionalHeader.SizeOfImage);
+		return true;
 	} __except (EXCEPTION_EXECUTE_HANDLER) {
-		return nullptr;
+		return false;
 	}
 }
 
-void InstallD3D9DetourBridge(HMODULE d3d9Mod)
+void InstallD3D9DetourBridgeFromDevice(IDirect3DDevice9 *realDev)
 {
-	if (g_detourBridgeInit || !d3d9Mod) return;
+	if (g_detourBridgeInit || !realDev) return;
 	g_detourBridgeInit = true;
 
+	HMODULE d3d9Mod = GetModuleHandleA("d3d9.dll");
 	uintptr_t imgStart = 0, imgEnd = 0;
-	void **vt = FindD3D9BaseVtableSafe(d3d9Mod, imgStart, imgEnd);
-	if (!vt) {
-		Log("Bridge: d3d9 CD3DBase vtable pattern not found - external d3d9 detours inactive");
-		return;
-	}
+	if (!GetModuleImageRange(d3d9Mod, imgStart, imgEnd)) return;
+
+	void **vt = *(void ***)realDev;
+	if (!vt) return;
 
 	auto inImg = [&](void *p) {
 		uintptr_t a = (uintptr_t)p;
@@ -3790,10 +4077,21 @@ void NotifyInputSample()
 	if (g_activeDev) g_activeDev->MarkInputSampled();
 }
 
+void *RenderEquippedAtomic(void *atomic, RenderRwObject render)
+{
+	return g_activeDev ? g_activeDev->RenderPlayerWeapon(atomic, render) : render(atomic);
+}
+
+void *RenderPlayerClump(void *clump, RenderRwObject render)
+{
+	return g_activeDev ? g_activeDev->RenderPlayer(clump, render) : render(clump);
+}
+
 void NotifyBefore2dStuff()
 {
 	if (g_activeDev) g_activeDev->OnBefore2dStuff();
 }
+
 
 DisplayTelemetry GetDisplayTelemetry()
 {

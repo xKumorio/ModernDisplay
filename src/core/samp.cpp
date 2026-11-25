@@ -7,6 +7,7 @@
 #include "../gfx/lut_loader.h"
 
 #include <windows.h>
+#include <algorithm>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -188,7 +189,8 @@ void __cdecl CmdModernDisplay(const char *params)
 			UINT eff = (hz > 40) ? (hz - 3) : 60;
 			ChatPrintf("{FF6EC7}<" MD_NAME "> {FFFFFF}FPS Limit: {A8FFB0}AUTO (%u FPS @ %uHz VRR)", eff, hz);
 		} else if (g_cfg.fpsLimit == 0) {
-			ChatMsg("{FF6EC7}<" MD_NAME "> {FFFFFF}FPS Limit: {A8FFB0}OFF (без лимита)");
+			ChatMsg(MdTr("{FF6EC7}<" MD_NAME "> {FFFFFF}FPS Limit: {A8FFB0}OFF (без лимита)",
+			             "{FF6EC7}<" MD_NAME "> {FFFFFF}FPS Limit: {A8FFB0}OFF (uncapped)"));
 		} else {
 			ChatPrintf("{FF6EC7}<" MD_NAME "> {FFFFFF}FPS Limit: {A8FFB0}%d FPS", g_cfg.fpsLimit);
 		}
@@ -344,7 +346,22 @@ void __cdecl CmdModernDisplay(const char *params)
 		g_cfg.rainFx = arg[0] ? (atoi(arg) != 0) : !g_cfg.rainFx;
 		ConfigNotifyChanged();
 		ConfigSave();
-		ChatPrintf("{FF6EC7}<" MD_NAME "> {FFFFFF}Rain Ripples & Screen Droplets: {A8FFB0}%s", g_cfg.rainFx ? "ON" : "OFF");
+		ChatPrintf("{FF6EC7}<" MD_NAME "> {FFFFFF}Rain Effects: {A8FFB0}%s", g_cfg.rainFx ? "ON" : "OFF");
+	} else if (_stricmp(cmd, "rainlight") == 0) {
+		g_cfg.rainLighting = arg[0] ? (atoi(arg) != 0) : !g_cfg.rainLighting;
+		ConfigNotifyChanged();
+		ConfigSave();
+		ChatPrintf("{FF6EC7}<" MD_NAME "> {FFFFFF}Rain Lighting: {A8FFB0}%s", g_cfg.rainLighting ? "ON" : "OFF");
+	} else if (_stricmp(cmd, "raindrops") == 0) {
+		g_cfg.rainLensDrops = arg[0] ? (atoi(arg) != 0) : !g_cfg.rainLensDrops;
+		ConfigNotifyChanged();
+		ConfigSave();
+		ChatPrintf("{FF6EC7}<" MD_NAME "> {FFFFFF}Rain Lens Drops: {A8FFB0}%s", g_cfg.rainLensDrops ? "ON" : "OFF");
+	} else if (_stricmp(cmd, "spray") == 0) {
+		if (arg[0]) g_cfg.wheelSpray = (std::clamp)(atoi(arg), 0, 2);
+		ConfigSave();
+		static const char *kSprayModes[] = { "OFF", "ORIGINAL", "REDUCED" };
+		ChatPrintf("{FF6EC7}<" MD_NAME "> {FFFFFF}Wheel Spray: {A8FFB0}%s", kSprayModes[g_cfg.wheelSpray]);
 	} else if (_stricmp(cmd, "bloom") == 0) {
 		if (!arg[0]) {
 			g_cfg.bloomStrength = (g_cfg.bloomStrength > 0.01f) ? 0.0f : 0.30f;
@@ -430,7 +447,8 @@ void __cdecl CmdModernDisplay(const char *params)
 		} else if (_stricmp(arg, "list") == 0) {
 			auto list = ListAvailableCubeLuts();
 			if (list.empty()) {
-				ChatMsg("{FF6EC7}<" MD_NAME "> {CCCCCC}Нет .cube файлов в папке ModernDisplay\\luts\\");
+				ChatMsg(MdTr("{FF6EC7}<" MD_NAME "> {CCCCCC}Нет .cube файлов в папке ModernDisplay\\luts\\",
+				             "{FF6EC7}<" MD_NAME "> {CCCCCC}No .cube files found in ModernDisplay\\luts\\"));
 			} else {
 				std::string joined;
 				for (size_t i = 0; i < list.size() && joined.size() < 200; ++i) {
@@ -480,7 +498,8 @@ void __cdecl CmdModernDisplay(const char *params)
 		g_cfg.forceWindowed = arg[0] ? (atoi(arg) != 0) : !g_cfg.forceWindowed;
 		ConfigNotifyChanged();
 		ConfigSave();
-		ChatPrintf("{FF6EC7}<" MD_NAME "> {FFFFFF}Startup Windowed: {A8FFB0}%s {CCCCCC}(переключить прямо сейчас: Alt+Enter)", g_cfg.forceWindowed ? "ON" : "OFF");
+		ChatPrintf(MdTr("{FF6EC7}<" MD_NAME "> {FFFFFF}Startup Windowed: {A8FFB0}%s {CCCCCC}(переключить прямо сейчас: Alt+Enter)",
+		                "{FF6EC7}<" MD_NAME "> {FFFFFF}Startup Windowed: {A8FFB0}%s {CCCCCC}(toggle live: Alt+Enter)"), g_cfg.forceWindowed ? "ON" : "OFF");
 	} else if (_stricmp(cmd, "compare") == 0 || _stricmp(cmd, "split") == 0 || _stricmp(cmd, "wipe") == 0) {
 		if (!arg[0]) {
 			g_cfg.compareMode = (g_cfg.compareMode + 1) % 4;
@@ -503,16 +522,19 @@ void __cdecl CmdModernDisplay(const char *params)
 		if (g_cfg.compareMode == 0) {
 			ChatMsg("{FF6EC7}<" MD_NAME "> {FFFFFF}Before/After Split: {A8FFB0}OFF");
 		} else if (g_cfg.compareMode == 1) {
-			ChatPrintf("{FF6EC7}<" MD_NAME "> {FFFFFF}Before/After Split: {A8FFB0}FIXED %.0f%% {CCCCCC}(Alt+Left/Right сдвиг, Alt+F9 режим)", g_cfg.comparePos * 100.0f);
+			ChatPrintf(MdTr("{FF6EC7}<" MD_NAME "> {FFFFFF}Before/After Split: {A8FFB0}FIXED %.0f%% {CCCCCC}(Alt+Left/Right сдвиг, Alt+F9 режим)",
+			                "{FF6EC7}<" MD_NAME "> {FFFFFF}Before/After Split: {A8FFB0}FIXED %.0f%% {CCCCCC}(Alt+Left/Right move, Alt+F9 mode)"), g_cfg.comparePos * 100.0f);
 		} else if (g_cfg.compareMode == 2) {
-			ChatMsg("{FF6EC7}<" MD_NAME "> {FFFFFF}Before/After Split: {A8FFB0}AUTO-SWEEP {CCCCCC}(Alt+F9 режим)");
+			ChatMsg(MdTr("{FF6EC7}<" MD_NAME "> {FFFFFF}Before/After Split: {A8FFB0}AUTO-SWEEP {CCCCCC}(Alt+F9 режим)",
+			             "{FF6EC7}<" MD_NAME "> {FFFFFF}Before/After Split: {A8FFB0}AUTO-SWEEP {CCCCCC}(Alt+F9 mode)"));
 		} else {
-			ChatMsg("{FF6EC7}<" MD_NAME "> {FFFFFF}Before/After Split: {A8FFB0}MOUSE FOLLOW {CCCCCC}(Alt+F9 режим)");
+			ChatMsg(MdTr("{FF6EC7}<" MD_NAME "> {FFFFFF}Before/After Split: {A8FFB0}MOUSE FOLLOW {CCCCCC}(Alt+F9 режим)",
+			             "{FF6EC7}<" MD_NAME "> {FFFFFF}Before/After Split: {A8FFB0}MOUSE FOLLOW {CCCCCC}(Alt+F9 mode)"));
 		}
 	} else if (_stricmp(cmd, "off") == 0) {
 		const bool anyGfxOn =
 			g_cfg.aoQuality > 0 || g_cfg.aaQuality > 0 || g_cfg.ssrQuality > 0 ||
-			g_cfg.giStrength > 0.001f || g_cfg.rainFx || g_cfg.bloomStrength > 0.001f ||
+			g_cfg.giStrength > 0.001f || g_cfg.rainFx || g_cfg.rainLighting || g_cfg.bloomStrength > 0.001f ||
 			g_cfg.bloomFlare || g_cfg.fogStrength > 0.001f || g_cfg.tonemapMode > 0 ||
 			g_cfg.clarity > 0.001f || g_cfg.sharpness > 0.001f || (g_cfg.vibrance > 0.001f || g_cfg.vibrance < -0.001f) ||
 			g_cfg.anisotropy > 0 || g_cfg.deband || g_cfg.renderScale > 1.01f || g_cfg.lutName[0] != 0;
@@ -525,6 +547,7 @@ void __cdecl CmdModernDisplay(const char *params)
 		g_cfg.ssrQuality    = 0;
 		g_cfg.giStrength    = 0.0f;
 		g_cfg.rainFx        = false;
+		g_cfg.rainLighting  = false;
 		g_cfg.bloomStrength = 0.0f;
 		g_cfg.bloomFlare    = false;
 		g_cfg.fogStrength   = 0.0f;
@@ -539,7 +562,8 @@ void __cdecl CmdModernDisplay(const char *params)
 		g_cfg.compareMode   = 0;
 		ConfigNotifyChanged();
 		ConfigSave();
-		ChatMsg("{FF6EC7}<" MD_NAME "> {FFFFFF}Вся графика: {FF9090}OFF {CCCCCC}(только оптимизации FPS; вернуть: /md on)");
+		ChatMsg(MdTr("{FF6EC7}<" MD_NAME "> {FFFFFF}Вся графика: {FF9090}OFF {CCCCCC}(только оптимизации FPS; вернуть: /md on)",
+		             "{FF6EC7}<" MD_NAME "> {FFFFFF}All graphics: {FF9090}OFF {CCCCCC}(FPS optimizations only; restore: /md on)"));
 	} else if (_stricmp(cmd, "on") == 0) {
 		if (g_mdHasSavedGfx) {
 			g_cfg.aoQuality     = g_mdSavedGfx.aoQuality;
@@ -548,6 +572,7 @@ void __cdecl CmdModernDisplay(const char *params)
 			g_cfg.ssrQuality    = g_mdSavedGfx.ssrQuality;
 			g_cfg.giStrength    = g_mdSavedGfx.giStrength;
 			g_cfg.rainFx        = g_mdSavedGfx.rainFx;
+			g_cfg.rainLighting  = g_mdSavedGfx.rainLighting;
 			g_cfg.bloomStrength = g_mdSavedGfx.bloomStrength;
 			g_cfg.bloomFlare    = g_mdSavedGfx.bloomFlare;
 			g_cfg.fogStrength   = g_mdSavedGfx.fogStrength;
@@ -566,6 +591,7 @@ void __cdecl CmdModernDisplay(const char *params)
 			g_cfg.ssrQuality    = 1;
 			g_cfg.giStrength    = 0.35f;
 			g_cfg.rainFx        = true;
+			g_cfg.rainLighting  = true;
 			g_cfg.bloomStrength = 0.28f;
 			g_cfg.bloomFlare    = true;
 			g_cfg.fogStrength   = 0.18f;
@@ -576,14 +602,27 @@ void __cdecl CmdModernDisplay(const char *params)
 		}
 		ConfigNotifyChanged();
 		ConfigSave();
-		ChatMsg("{FF6EC7}<" MD_NAME "> {FFFFFF}Вся графика: {A8FFB0}ON {CCCCCC}(выключить: /md off)");
+		ChatMsg(MdTr("{FF6EC7}<" MD_NAME "> {FFFFFF}Вся графика: {A8FFB0}ON {CCCCCC}(выключить: /md off)",
+		             "{FF6EC7}<" MD_NAME "> {FFFFFF}All graphics: {A8FFB0}ON {CCCCCC}(disable: /md off)"));
+	} else if (_stricmp(cmd, "lang") == 0 || _stricmp(cmd, "language") == 0 || _stricmp(cmd, "english") == 0) {
+		if (_stricmp(arg, "en") == 0 || _stricmp(arg, "eng") == 0 || _stricmp(arg, "english") == 0 || strcmp(arg, "1") == 0)
+			g_cfg.english = true;
+		else if (_stricmp(arg, "ru") == 0 || _stricmp(arg, "rus") == 0 || _stricmp(arg, "russian") == 0 || strcmp(arg, "0") == 0)
+			g_cfg.english = false;
+		else
+			g_cfg.english = !g_cfg.english;
+		ConfigSave();
+		ChatMsg(g_cfg.english
+			? "{FF6EC7}<" MD_NAME "> {FFFFFF}Language: {A8FFB0}English {CCCCCC}(ModernDisplay.ini rewritten)"
+			: "{FF6EC7}<" MD_NAME "> {FFFFFF}Язык: {A8FFB0}Русский {CCCCCC}(ModernDisplay.ini перезаписан)");
 	} else if (_stricmp(cmd, "hud") == 0 || _stricmp(cmd, "overlay") == 0) {
 		g_cfg.overlay = arg[0] ? (atoi(arg) != 0) : !g_cfg.overlay;
 		ConfigNotifyChanged();
 		ConfigSave();
 		ChatPrintf("{FF6EC7}<" MD_NAME "> {FFFFFF}Telemetry HUD: {A8FFB0}%s", g_cfg.overlay ? "ON" : "OFF");
 	} else {
-		ChatMsg("{FF6EC7}<" MD_NAME "> {CCCCCC}Команды: /md on | off | ao | aa | ssr | gi | bloom | fog | tonemap | ssaa | fps | hud");
+		ChatMsg(MdTr("{FF6EC7}<" MD_NAME "> {CCCCCC}Команды: /md on | off | lang | ao | aa | ssr | gi | bloom | fog | tonemap | ssaa | fps | hud",
+		             "{FF6EC7}<" MD_NAME "> {CCCCCC}Commands: /md on | off | lang | ao | aa | ssr | gi | bloom | fog | tonemap | ssaa | fps | hud"));
 	}
 }
 

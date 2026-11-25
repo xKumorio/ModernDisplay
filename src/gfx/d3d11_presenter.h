@@ -9,6 +9,7 @@
 #include <string>
 
 #include "nvapi_reflex.h"
+#include "road_surface.h"
 #include "../core/config.h"
 
 void ComputeDisplayViewport(UINT gameW, UINT gameH, UINT swapW, UINT swapH, ScalingMode mode,
@@ -34,6 +35,10 @@ struct FrameCameraParams {
 	float sunDirWorld[3]= { 0.3f, 0.5f, 0.8f };
 	float camPitchZ     = 0.0f;   // Camera forward world Z (-1=down, 0=horizon, +1=up)
 	bool  inInterior    = false;  // CGame::currArea != 0
+	bool  sheltered     = false;
+	bool  hasRoadGrid   = false;
+	float actorCrop[4] = {}; // screen UV origin and extent of reflected player
+	float actorGround[4] = {}; // player XYZ and reflecting plane Z
 };
 
 class D3D11Presenter {
@@ -45,16 +50,18 @@ public:
 
 	bool BindSharedTextures(const HANDLE colorHandles[kNumSlots],
 	                        const HANDLE world3dHandles[kNumSlots],
-	                        const HANDLE depthHandles[kNumSlots],
+	                        const HANDLE depthHandles[kNumSlots], const HANDLE actorHandles[kNumSlots],
 	                        UINT gameW, UINT gameH);
 	void UnbindSharedTextures();
 	bool ResizeSwapChain(UINT swapW, UINT swapH);
 
 	// Thread-safe ping-pong submission (async when g_cfg.asyncPresent is enabled)
 	void WaitForSlot(int slot);
+	bool CanShareRenderTargets() const;
+	RoadSurfaceGrid &RoadGridForSlot(int slot) { return m_roadGrids[slot]; }
 	void SubmitFrame(int slot, uint64_t frameId, bool async, bool isMinimized = false,
 	                 int64_t inputSampleQpc = 0, bool has3dMask = false, bool hasDepth = false,
-	                 const FrameCameraParams *cam = nullptr);
+	                 const FrameCameraParams *cam = nullptr, bool frontEnd = false);
 	void DrainAsync();
 
 	void SetGammaRamp(const D3DGAMMARAMP &ramp);
@@ -71,6 +78,7 @@ private:
 		int64_t           inputQpc = 0;
 		bool              has3dMask = false;
 		bool              hasDepth = false;
+		bool              frontEnd = false;
 		FrameCameraParams cam = {};
 	};
 
@@ -88,8 +96,9 @@ private:
 	void RenderXeGtao(int slot, int quality, float strength, const float reProj[16], bool useHist, const FrameCameraParams &cam);
 	bool CreateSsrPipeline();
 	bool EnsureSsrTargets(UINT w, UINT h);
+	bool EnsurePuddleTarget();
 	void ReleaseSsrTargets();
-	void RenderSsr(int slot, int quality, bool use3dTex, bool rainFx, const FrameCameraParams &cam);
+	ID3D11ShaderResourceView *RenderSsr(int slot, int quality, bool use3dTex, bool rainFx, const FrameCameraParams &cam);
 	bool CreateSsgiPipeline();
 	bool EnsureSsgiTargets(UINT w, UINT h);
 	void ReleaseSsgiTargets();
@@ -131,6 +140,8 @@ private:
 	ID3D11ShaderResourceView *m_sharedSrv[kNumSlots] = {};
 	ID3D11Texture2D          *m_shared3dTex[kNumSlots] = {};
 	ID3D11ShaderResourceView *m_shared3dSrv[kNumSlots] = {};
+	ID3D11Texture2D          *m_actorTex[kNumSlots] = {};
+	ID3D11ShaderResourceView *m_actorSrv[kNumSlots] = {};
 	ID3D11Texture2D          *m_sharedDepthTex[kNumSlots] = {};
 	ID3D11ShaderResourceView *m_sharedDepthSrv[kNumSlots] = {};
 
@@ -153,6 +164,15 @@ private:
 	ID3D11PixelShader        *m_aoDepthLinPS = nullptr;
 	ID3D11PixelShader        *m_aoDepthMipPS = nullptr;
 	ID3D11PixelShader        *m_aoPS = nullptr;
+	ID3D11PixelShader        *m_aoReusePS = nullptr;
+	ID3D11DepthStencilState  *m_markReused = nullptr;
+	ID3D11DepthStencilState  *m_traceMissing = nullptr;
+	ID3D11DepthStencilView   *m_aoStencil = nullptr;
+	ID3D11Texture2D          *m_prevRawTex = nullptr;
+	ID3D11RenderTargetView   *m_prevRawRtv = nullptr;
+	ID3D11ShaderResourceView *m_prevRawSrv = nullptr;
+	int                       m_prevRawQuality = 0;
+	float                     m_prevRawStrength = 0.0f;
 	ID3D11PixelShader        *m_aoDenoise2dPS = nullptr;
 	ID3D11PixelShader        *m_aoBlurPS = nullptr;
 	ID3D11PixelShader        *m_aoTemporalPS = nullptr;
@@ -205,6 +225,10 @@ private:
 
 	// Screen-Space Reflections (SSR) — half-res water & rain-wet puddles + bilateral roughness blur
 	ID3D11PixelShader        *m_ssrPS = nullptr;
+	ID3D11PixelShader        *m_roadPuddlesPS = nullptr;
+	ID3D11Texture2D          *m_roadGridTexture = nullptr;
+	ID3D11ShaderResourceView *m_roadGridSrv = nullptr;
+	RoadSurfaceGrid          m_roadGrids[kNumSlots];
 	ID3D11PixelShader        *m_ssrBlurPS = nullptr;
 	ID3D11Buffer             *m_ssrCB = nullptr;
 	ID3D11Texture2D          *m_ssrTex = nullptr;
@@ -215,6 +239,9 @@ private:
 	ID3D11ShaderResourceView *m_ssrTmpSrv = nullptr;
 	UINT                      m_ssrW = 0;
 	UINT                      m_ssrH = 0;
+	ID3D11RenderTargetView   *m_puddleRtv = nullptr;
+	ID3D11ShaderResourceView *m_puddleSrv = nullptr;
+	UINT                      m_puddleW = 0, m_puddleH = 0;
 
 	// Temporal Screen-Space Global Illumination (SSGI — half-res 3D color bounce + bilateral blur + temporal reprojection)
 	ID3D11PixelShader        *m_ssgiPS = nullptr;
@@ -296,6 +323,8 @@ private:
 	bool                      m_stopThread = false;
 	bool                      m_slotBusy[kNumSlots] = {};
 	ID3D11Query              *m_slotQuery[kNumSlots] = {};
+	IDXGIDevice2             *m_queueDevice = nullptr;
+	HANDLE                    m_slotReady[kNumSlots] = {};
 	QueuedFrame               m_queued = {};
 	bool                      m_inFlight = false;
 

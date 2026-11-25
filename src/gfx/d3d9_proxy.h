@@ -9,7 +9,7 @@ typedef BOOL(WINAPI *SetCursorPos_t)(int, int);
 typedef BOOL(WINAPI *GetClientRect_t)(HWND, LPRECT);
 
 IDirect3D9      *CreateProxyDirect3D9(IDirect3D9Ex *realEx, Direct3DCreate9_t fallbackCreate9, UINT sdkVersion);
-void             InstallD3D9DetourBridge(HMODULE d3d9Mod);
+void             InstallD3D9DetourBridgeFromDevice(IDirect3DDevice9 *realDev);
 void             SetRawCursorPosFn(SetCursorPos_t fn);
 void             SetRawGetClientRectFn(GetClientRect_t fn);
 HWND             GetActiveGameWindow();
@@ -20,4 +20,7 @@ void             MapGameToPhysicalClient(LONG &x, LONG &y);
 bool             IsGameWindowDeactivating();
 void             NotifyInputSample();
 void             NotifyBefore2dStuff();
+using RenderRwObject = void *(__cdecl *)(void *);
+void            *RenderPlayerClump(void *clump, RenderRwObject render);
+void            *RenderEquippedAtomic(void *atomic, RenderRwObject render);
 DisplayTelemetry GetDisplayTelemetry();
